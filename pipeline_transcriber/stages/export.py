@@ -72,7 +72,7 @@ class ExportStage(BaseStage):
         vtt_path.write_text("\n".join(vtt_lines))
         artifacts.append(str(vtt_path))
 
-        log.info(num_formats=4)
+        log.info("export_complete", num_formats=4)
         return StageResult(
             status=StageStatus.SUCCESS,
             artifacts=artifacts,

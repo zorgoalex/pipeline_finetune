@@ -41,7 +41,7 @@ class DownloadStage(BaseStage):
 
         artifacts = [str(media_path), str(meta_path)]
 
-        log.info(artifacts=artifacts)
+        log.info("download_complete", artifacts=artifacts)
         return StageResult(status=StageStatus.SUCCESS, artifacts=artifacts)
 
     def validate(self, ctx: StageContext, result: StageResult) -> ValidationResult:
