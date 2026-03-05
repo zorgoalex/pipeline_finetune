@@ -1,0 +1,81 @@
+app:
+  work_dir: "./output"
+  tmp_dir: "./output/tmp"
+  resume_enabled: true
+  cleanup_policy: "on_success"
+  fail_fast_batch: false
+  max_parallel_jobs: 1
+
+logging:
+  level: "INFO"
+  json: true
+  log_dir: "./output/logs"
+  file_rotation_mb: 10
+  retention_count: 5
+
+downloader:
+  enabled: true
+  yt_dlp_path: "yt-dlp"
+  timeout_sec: 600
+  format: "bestaudio/best"
+
+ffmpeg:
+  ffmpeg_path: "ffmpeg"
+  ffprobe_path: "ffprobe"
+  audio_sr: 16000
+  audio_channels: 1
+  normalize_audio: false
+
+vad:
+  enabled: true
+  backend: "silero"
+  min_speech_duration_sec: 0.3
+  min_silence_duration_sec: 0.3
+  max_segment_sec: 15
+  padding_sec: 0.15
+  export_clips: false
+
+asr:
+  engine: "whisperx"
+  model_name: "small"
+  device: "auto"
+  compute_type: "int8"
+  beam_size: 5
+  batch_size: 16
+  language: "auto"
+  condition_on_previous_text: false
+  mode: "full_audio"
+
+alignment:
+  enabled: true
+  require_word_alignment: false
+  allow_fallback_skip: true
+  align_model_overrides: {}
+
+diarization:
+  enabled: true
+  backend: "pyannote"
+  pipeline_name: "pyannote/speaker-diarization-3.1"
+  hf_token_env_var: "HF_TOKEN"
+  min_speakers: 1
+  max_speakers: 10
+
+export:
+  formats: ["json", "srt", "vtt", "txt"]
+  speaker_prefix: true
+  highlight_words: false
+
+qa:
+  min_aligned_words_ratio: 0.7
+  min_speaker_assigned_ratio: 0.9
+  fail_on_missing_word_timestamps: false
+  fail_on_missing_diarization: true
+
+retry:
+  max_attempts: 5
+  backoff_schedule: [2, 5, 10, 20, 30]
+
+alerts:
+  enabled: true
+  channels: ["stderr", "jsonl"]
+  alerts_file: "./output/alerts.jsonl"

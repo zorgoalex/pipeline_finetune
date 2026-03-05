@@ -1,0 +1,2 @@
+{"job_id": "demo-youtube-01", "source_type": "youtube", "source": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "language": "en", "enable_diarization": true, "enable_word_timestamps": true, "output_formats": ["json", "srt", "vtt", "txt"], "expected_speakers": {"min": 1, "max": 3}, "metadata": {"project": "demo"}}
+{"job_id": "demo-local-01", "source_type": "local_file", "source": "/path/to/audio.wav", "language": "auto", "enable_diarization": false, "enable_word_timestamps": true, "output_formats": ["json", "txt"], "expected_speakers": null, "metadata": {}}
