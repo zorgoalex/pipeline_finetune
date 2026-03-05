@@ -11,6 +11,7 @@ from pipeline_transcriber.models.stage import (
     ValidationResult,
 )
 from pipeline_transcriber.stages.base import BaseStage, StageContext
+from pipeline_transcriber.utils.timecode import seconds_to_srt, seconds_to_vtt
 
 
 class ExportStage(BaseStage):
@@ -22,68 +23,70 @@ class ExportStage(BaseStage):
         log = self._log(ctx)
         log.info("stage_started")
 
-        # Use fused result if available, otherwise aligned, otherwise asr
+        # Use best available result: fused > aligned > asr
         source = ctx.fused_result or ctx.aligned_result or ctx.asr_result or {"segments": []}
         segments = source.get("segments", [])
 
+        export_cfg = ctx.config.export
+        requested_formats = export_cfg.formats if export_cfg.formats else ["json", "srt", "vtt", "txt"]
+
         artifacts: list[str] = []
 
-        # final.json - always written
-        final_path = ctx.job_dir / "final.json"
-        final_path.write_text(json.dumps(source, indent=2))
-        artifacts.append(str(final_path))
+        if "json" in requested_formats:
+            final_path = ctx.job_dir / "final.json"
+            final_path.write_text(json.dumps(source, indent=2, ensure_ascii=False))
+            artifacts.append(str(final_path))
 
-        # transcript.txt
-        txt_path = ctx.job_dir / "transcript.txt"
-        lines = []
-        for seg in segments:
-            speaker = seg.get("speaker", "")
-            prefix = f"[{speaker}] " if speaker else ""
-            lines.append(f"{prefix}{seg.get('text', '')}")
-        txt_path.write_text("\n".join(lines) + "\n")
-        artifacts.append(str(txt_path))
+        if "txt" in requested_formats:
+            txt_path = ctx.job_dir / "transcript.txt"
+            lines = []
+            for seg in segments:
+                speaker = seg.get("speaker", "")
+                prefix = f"[{speaker}] " if speaker and export_cfg.speaker_prefix else ""
+                lines.append(f"{prefix}{seg.get('text', '')}")
+            txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            artifacts.append(str(txt_path))
 
-        # transcript.srt
-        srt_path = ctx.job_dir / "transcript.srt"
-        srt_lines = []
-        for i, seg in enumerate(segments, 1):
-            start_ts = _format_srt_time(seg.get("start", 0.0))
-            end_ts = _format_srt_time(seg.get("end", 0.0))
-            speaker = seg.get("speaker", "")
-            prefix = f"[{speaker}] " if speaker else ""
-            srt_lines.append(f"{i}")
-            srt_lines.append(f"{start_ts} --> {end_ts}")
-            srt_lines.append(f"{prefix}{seg.get('text', '')}")
-            srt_lines.append("")
-        srt_path.write_text("\n".join(srt_lines))
-        artifacts.append(str(srt_path))
+        if "srt" in requested_formats:
+            srt_path = ctx.job_dir / "transcript.srt"
+            srt_lines: list[str] = []
+            for i, seg in enumerate(segments, 1):
+                start_ts = seconds_to_srt(seg.get("start", 0.0))
+                end_ts = seconds_to_srt(seg.get("end", 0.0))
+                speaker = seg.get("speaker", "")
+                prefix = f"[{speaker}] " if speaker and export_cfg.speaker_prefix else ""
+                srt_lines.append(str(i))
+                srt_lines.append(f"{start_ts} --> {end_ts}")
+                srt_lines.append(f"{prefix}{seg.get('text', '')}")
+                srt_lines.append("")
+            srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
+            artifacts.append(str(srt_path))
 
-        # transcript.vtt
-        vtt_path = ctx.job_dir / "transcript.vtt"
-        vtt_lines = ["WEBVTT", ""]
-        for seg in segments:
-            start_ts = _format_vtt_time(seg.get("start", 0.0))
-            end_ts = _format_vtt_time(seg.get("end", 0.0))
-            speaker = seg.get("speaker", "")
-            prefix = f"[{speaker}] " if speaker else ""
-            vtt_lines.append(f"{start_ts} --> {end_ts}")
-            vtt_lines.append(f"{prefix}{seg.get('text', '')}")
-            vtt_lines.append("")
-        vtt_path.write_text("\n".join(vtt_lines))
-        artifacts.append(str(vtt_path))
+        if "vtt" in requested_formats:
+            vtt_path = ctx.job_dir / "transcript.vtt"
+            vtt_lines = ["WEBVTT", ""]
+            for seg in segments:
+                start_ts = seconds_to_vtt(seg.get("start", 0.0))
+                end_ts = seconds_to_vtt(seg.get("end", 0.0))
+                speaker = seg.get("speaker", "")
+                prefix = f"[{speaker}] " if speaker and export_cfg.speaker_prefix else ""
+                vtt_lines.append(f"{start_ts} --> {end_ts}")
+                vtt_lines.append(f"{prefix}{seg.get('text', '')}")
+                vtt_lines.append("")
+            vtt_path.write_text("\n".join(vtt_lines), encoding="utf-8")
+            artifacts.append(str(vtt_path))
 
-        log.info("export_complete", num_formats=4)
+        log.info("export_complete", num_formats=len(requested_formats), formats=requested_formats)
         return StageResult(
             status=StageStatus.SUCCESS,
             artifacts=artifacts,
-            metrics={"num_formats": 4},
+            metrics={"num_formats": len(requested_formats), "num_segments": len(segments)},
         )
 
     def validate(self, ctx: StageContext, result: StageResult) -> ValidationResult:
         checks: list[CheckResult] = []
         all_ok = True
 
-        # Check that all requested format files exist
         format_map = {
             "json": "final.json",
             "txt": "transcript.txt",
@@ -108,19 +111,3 @@ class ExportStage(BaseStage):
                 all_ok = False
 
         return ValidationResult(ok=all_ok, checks=checks, next_stage_allowed=all_ok)
-
-
-def _format_srt_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds - int(seconds)) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def _format_vtt_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds - int(seconds)) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"

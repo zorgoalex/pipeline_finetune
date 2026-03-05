@@ -17,10 +17,14 @@ from pipeline_transcriber.stages.align import AlignStage
 
 
 def make_context(tmp_path):
+    # Create a real source file so download stage can copy it
+    source_file = tmp_path / "test_source.wav"
+    source_file.write_bytes(b"RIFF" + b"\x00" * 100)
+
     job = Job(
         job_id="test-01",
         source_type="local_file",
-        source="/tmp/test.wav",
+        source=str(source_file),
         output_formats=["json", "txt"],
     )
     config = PipelineConfig()
