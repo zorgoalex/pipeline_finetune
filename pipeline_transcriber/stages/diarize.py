@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from typing import Any
 
 from pipeline_transcriber.models.stage import (
     CheckResult,
@@ -11,6 +13,12 @@ from pipeline_transcriber.models.stage import (
     ValidationResult,
 )
 from pipeline_transcriber.stages.base import BaseStage, StageContext
+from pipeline_transcriber.utils.rttm import write_rttm
+
+
+class HfTokenError(Exception):
+    """Raised when HuggingFace token is missing or invalid."""
+    pass
 
 
 class DiarizeStage(BaseStage):
@@ -22,50 +30,124 @@ class DiarizeStage(BaseStage):
         log = self._log(ctx)
         log.info("stage_started")
 
+        if ctx.audio_path is None:
+            raise RuntimeError("No audio path available for diarization")
+
+        diar_cfg = ctx.config.diarization
+        hf_token = os.environ.get(diar_cfg.hf_token_env_var)
+        if not hf_token:
+            raise HfTokenError(
+                f"HuggingFace token not found in env var '{diar_cfg.hf_token_env_var}'. "
+                "Required for pyannote diarization. "
+                "Set it and accept model conditions at huggingface.co."
+            )
+
         diar_dir = ctx.artifacts_dir / "diarization"
         diar_dir.mkdir(parents=True, exist_ok=True)
 
-        # Mock RTTM lines
-        rttm_lines = [
-            "SPEAKER audio 1 0.000 5.000 <NA> <NA> SPEAKER_00 <NA> <NA>",
-            "SPEAKER audio 1 6.000 5.000 <NA> <NA> SPEAKER_01 <NA> <NA>",
-            "SPEAKER audio 1 12.000 3.000 <NA> <NA> SPEAKER_00 <NA> <NA>",
-        ]
+        device = self._resolve_device(ctx)
 
+        log.info(
+            "diarization_starting",
+            pipeline=diar_cfg.pipeline_name,
+            device=device,
+            min_speakers=diar_cfg.min_speakers,
+            max_speakers=diar_cfg.max_speakers,
+        )
+
+        diar_segments, num_speakers = self._run_pyannote(ctx, hf_token, device)
+
+        # Save RTTM
         rttm_path = diar_dir / "diarization_raw.rttm"
-        rttm_path.write_text("\n".join(rttm_lines) + "\n")
+        write_rttm(diar_segments, rttm_path)
 
-        diar_segments = [
-            {"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00"},
-            {"start": 6.0, "end": 11.0, "speaker": "SPEAKER_01"},
-            {"start": 12.0, "end": 15.0, "speaker": "SPEAKER_00"},
-        ]
-
+        # Save segments JSON
         segments_path = diar_dir / "diarization_segments.json"
         segments_path.write_text(json.dumps(diar_segments, indent=2))
 
-        report_path = diar_dir / "diarization_report.json"
+        # Save report
         report = {
-            "backend": ctx.config.diarization.backend,
-            "num_speakers": 2,
+            "backend": diar_cfg.backend,
+            "pipeline": diar_cfg.pipeline_name,
+            "device": device,
+            "num_speakers": num_speakers,
             "num_segments": len(diar_segments),
+            "min_speakers_config": diar_cfg.min_speakers,
+            "max_speakers_config": diar_cfg.max_speakers,
         }
+        report_path = diar_dir / "diarization_report.json"
         report_path.write_text(json.dumps(report, indent=2))
 
-        ctx.diarization_result = {"segments": diar_segments, "num_speakers": 2}
+        ctx.diarization_result = {
+            "segments": diar_segments,
+            "num_speakers": num_speakers,
+        }
 
         artifacts = [str(rttm_path), str(segments_path), str(report_path)]
-
-        log.info(num_speakers=2)
+        log.info(
+            "diarization_complete",
+            num_speakers=num_speakers,
+            num_segments=len(diar_segments),
+        )
         return StageResult(
             status=StageStatus.SUCCESS,
             artifacts=artifacts,
-            metrics={"num_speakers": 2, "num_segments": len(diar_segments)},
+            metrics={"num_speakers": num_speakers, "num_segments": len(diar_segments)},
         )
+
+    def _run_pyannote(
+        self, ctx: StageContext, hf_token: str, device: str
+    ) -> tuple[list[dict], int]:
+        """Run pyannote diarization pipeline via whisperx."""
+        import whisperx
+
+        diar_cfg = ctx.config.diarization
+
+        diarize_model = whisperx.DiarizationPipeline(
+            model_name=diar_cfg.pipeline_name,
+            use_auth_token=hf_token,
+            device=device,
+        )
+
+        diarize_kwargs: dict[str, Any] = {}
+        if diar_cfg.min_speakers > 0:
+            diarize_kwargs["min_speakers"] = diar_cfg.min_speakers
+        if diar_cfg.max_speakers > 0:
+            diarize_kwargs["max_speakers"] = diar_cfg.max_speakers
+
+        audio = whisperx.load_audio(str(ctx.audio_path))
+        diarize_result = diarize_model(audio, **diarize_kwargs)
+
+        # Convert pyannote output to segment dicts
+        segments: list[dict] = []
+        speakers_seen: set[str] = set()
+
+        for turn, _, speaker in diarize_result.itertracks(yield_label=True):
+            segments.append({
+                "start": round(turn.start, 3),
+                "end": round(turn.end, 3),
+                "duration": round(turn.end - turn.start, 3),
+                "speaker": speaker,
+            })
+            speakers_seen.add(speaker)
+
+        segments.sort(key=lambda s: s["start"])
+        return segments, len(speakers_seen)
+
+    def _resolve_device(self, ctx: StageContext) -> str:
+        device = ctx.config.asr.device
+        if device != "auto":
+            return device
+        try:
+            import torch
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            return "cpu"
 
     def validate(self, ctx: StageContext, result: StageResult) -> ValidationResult:
         checks: list[CheckResult] = []
         all_ok = True
+
         for artifact in result.artifacts:
             exists = Path(artifact).exists()
             checks.append(
@@ -77,4 +159,39 @@ class DiarizeStage(BaseStage):
             )
             if not exists:
                 all_ok = False
+
+        if ctx.diarization_result:
+            diar_segs = ctx.diarization_result.get("segments", [])
+            num_speakers = ctx.diarization_result.get("num_speakers", 0)
+            diar_cfg = ctx.config.diarization
+
+            has_segments = len(diar_segs) > 0
+            checks.append(
+                CheckResult(
+                    name="diarization_segments_non_empty",
+                    passed=has_segments,
+                    details=f"Diarization produced {len(diar_segs)} segments.",
+                )
+            )
+            if not has_segments:
+                all_ok = False
+
+            # Check speaker count within configured bounds
+            speakers_ok = diar_cfg.min_speakers <= num_speakers <= diar_cfg.max_speakers
+            checks.append(
+                CheckResult(
+                    name="speaker_count_in_range",
+                    passed=speakers_ok,
+                    details=f"Found {num_speakers} speakers (expected {diar_cfg.min_speakers}-{diar_cfg.max_speakers}).",
+                )
+            )
+            # Speaker count out of range is a warning, not a failure
+            if not speakers_ok:
+                pass  # informational only
+
         return ValidationResult(ok=all_ok, checks=checks, next_stage_allowed=all_ok)
+
+    def can_retry(self, error: Exception | None, ctx: StageContext) -> bool:
+        if isinstance(error, HfTokenError):
+            return False
+        return True

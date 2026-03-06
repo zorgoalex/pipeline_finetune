@@ -23,8 +23,9 @@ class QaStage(BaseStage):
 
         checks: list[dict[str, object]] = []
         warnings: list[str] = []
+        qa_cfg = ctx.config.qa
 
-        # Check that final.json exists
+        # 1. Check final.json exists
         final_path = ctx.job_dir / "final.json"
         final_exists = final_path.exists()
         checks.append({
@@ -33,7 +34,7 @@ class QaStage(BaseStage):
             "details": f"{final_path} exists={final_exists}",
         })
 
-        # Check segments exist in result data
+        # 2. Check segments exist
         source = ctx.fused_result or ctx.aligned_result or ctx.asr_result or {}
         segments = source.get("segments", [])
         has_segments = len(segments) > 0
@@ -44,6 +45,67 @@ class QaStage(BaseStage):
         })
         if not has_segments:
             warnings.append("No segments found in transcript result.")
+
+        # 3. Validate time intervals
+        valid_times = all(
+            seg.get("start", 0) < seg.get("end", 0)
+            for seg in segments
+        ) if segments else True
+        checks.append({
+            "name": "time_intervals_valid",
+            "passed": valid_times,
+            "details": "All segments have start < end." if valid_times else "Some segments have invalid time intervals.",
+        })
+
+        # 4. Word alignment ratio check (if alignment was run)
+        if ctx.aligned_result:
+            aligned_segs = ctx.aligned_result.get("segments", [])
+            if aligned_segs:
+                with_words = sum(1 for s in aligned_segs if s.get("words"))
+                ratio = with_words / len(aligned_segs)
+                threshold = qa_cfg.min_aligned_words_ratio
+                ratio_ok = ratio >= threshold
+                checks.append({
+                    "name": "word_alignment_ratio",
+                    "passed": ratio_ok,
+                    "details": f"Word alignment ratio {ratio:.2f} vs threshold {threshold:.2f}",
+                })
+                if not ratio_ok:
+                    if qa_cfg.fail_on_missing_word_timestamps:
+                        pass  # will fail
+                    else:
+                        warnings.append(f"Word alignment ratio {ratio:.2f} below threshold {threshold:.2f}")
+
+        # 5. Speaker assignment ratio check (if diarization was run)
+        if ctx.fused_result:
+            fused_segs = ctx.fused_result.get("segments", [])
+            if fused_segs:
+                assigned = sum(1 for s in fused_segs if s.get("speaker", "UNKNOWN") != "UNKNOWN")
+                ratio = assigned / len(fused_segs)
+                threshold = qa_cfg.min_speaker_assigned_ratio
+                ratio_ok = ratio >= threshold
+                checks.append({
+                    "name": "speaker_assignment_ratio",
+                    "passed": ratio_ok,
+                    "details": f"Speaker assignment ratio {ratio:.2f} vs threshold {threshold:.2f}",
+                })
+                if not ratio_ok:
+                    if qa_cfg.fail_on_missing_diarization:
+                        pass  # will fail
+                    else:
+                        warnings.append(f"Speaker assignment ratio {ratio:.2f} below threshold {threshold:.2f}")
+
+        # 6. Check no negative durations
+        neg_durations = [
+            seg for seg in segments
+            if seg.get("end", 0) - seg.get("start", 0) < 0
+        ]
+        no_neg = len(neg_durations) == 0
+        checks.append({
+            "name": "no_negative_durations",
+            "passed": no_neg,
+            "details": f"Found {len(neg_durations)} segments with negative duration." if not no_neg else "No negative durations.",
+        })
 
         all_passed = all(c["passed"] for c in checks)
 
@@ -62,13 +124,19 @@ class QaStage(BaseStage):
             "num_checks": len(checks),
             "num_passed": sum(1 for c in checks if c["passed"]),
             "num_failed": sum(1 for c in checks if not c["passed"]),
+            "num_warnings": len(warnings),
         }
         qa_summary_path = ctx.job_dir / "qa_summary.json"
         qa_summary_path.write_text(json.dumps(qa_summary, indent=2))
 
         artifacts = [str(report_path), str(qa_summary_path)]
 
-        log.info(all_passed=all_passed)
+        log.info(
+            "qa_complete",
+            all_passed=all_passed,
+            num_checks=len(checks),
+            num_warnings=len(warnings),
+        )
         return StageResult(
             status=StageStatus.SUCCESS,
             artifacts=artifacts,
@@ -76,7 +144,6 @@ class QaStage(BaseStage):
         )
 
     def validate(self, ctx: StageContext, result: StageResult) -> ValidationResult:
-        # QA validation always passes - it is an informational stage
         return ValidationResult(
             ok=True,
             checks=[
