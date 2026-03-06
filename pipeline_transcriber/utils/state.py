@@ -25,10 +25,12 @@ class JobState:
         self.stage_attempts: dict[str, int] = {}
         self.failed_stages: dict[str, dict[str, Any]] = {}
         self.stage_ledger: list[dict[str, Any]] = []
+        self.finalization_status: str | None = None  # "success" | "failed"
         self.updated_at: str | None = None
         # Canonical state fields
         self.execution_plan: list[str] = []
         self.config_hash: str = ""
+        self.job_hash: str = ""
         self.job_snapshot: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
@@ -84,8 +86,10 @@ class JobState:
             "stage_attempts": self.stage_attempts,
             "failed_stages": self.failed_stages,
             "stage_ledger": self.stage_ledger,
+            "finalization_status": self.finalization_status,
             "execution_plan": self.execution_plan,
             "config_hash": self.config_hash,
+            "job_hash": self.job_hash,
             "job_snapshot": self.job_snapshot,
             "updated_at": self.updated_at,
         }
@@ -110,8 +114,10 @@ class JobState:
             state.stage_attempts = data.get("stage_attempts", {})
             state.failed_stages = data.get("failed_stages", {})
             state.stage_ledger = data.get("stage_ledger", [])
+            state.finalization_status = data.get("finalization_status")
             state.execution_plan = data.get("execution_plan", [])
             state.config_hash = data.get("config_hash", "")
+            state.job_hash = data.get("job_hash", "")
             state.job_snapshot = data.get("job_snapshot", {})
             state.updated_at = data.get("updated_at")
         return state

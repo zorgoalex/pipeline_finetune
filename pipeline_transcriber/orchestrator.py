@@ -89,21 +89,44 @@ class Orchestrator:
         new_plan = [s.stage_name.value for s in stages]
 
         # Save canonical state fields
+        job_dict = job.model_dump(mode="json")
         if not resume:
             state.execution_plan = new_plan
             state.config_hash = JobState.compute_config_hash(
                 job_config.model_dump(mode="json"),
             )
-            state.job_snapshot = job.model_dump(mode="json")
+            state.job_hash = JobState.compute_config_hash(job_dict)
+            state.job_snapshot = job_dict
         else:
             # Check for config drift
-            current_hash = JobState.compute_config_hash(
+            current_config_hash = JobState.compute_config_hash(
                 job_config.model_dump(mode="json"),
             )
-            if state.config_hash and state.config_hash != current_hash:
+            if state.config_hash and state.config_hash != current_config_hash:
                 log.warning("resume_config_drift",
                             old_hash=state.config_hash[:12],
-                            new_hash=current_hash[:12])
+                            new_hash=current_config_hash[:12])
+
+            # Check for job drift
+            current_job_hash = JobState.compute_config_hash(job_dict)
+            if state.job_hash and state.job_hash != current_job_hash:
+                log.warning("resume_job_drift",
+                            old_hash=state.job_hash[:12],
+                            new_hash=current_job_hash[:12])
+                # Critical fields change → invalidate all completed stages
+                critical_fields = (
+                    "source", "source_type", "language",
+                    "enable_diarization", "enable_word_timestamps",
+                )
+                old_snap = state.job_snapshot
+                critical_changed = [
+                    f for f in critical_fields
+                    if old_snap.get(f) != job_dict.get(f)
+                ]
+                if critical_changed:
+                    log.warning("resume_job_critical_drift",
+                                changed_fields=critical_changed)
+                    state.completed_stages = []
 
             # Intersect completed_stages with new execution plan
             old_completed = set(state.completed_stages)
@@ -115,6 +138,8 @@ class Orchestrator:
                 s for s in state.completed_stages if s in new_plan_set
             ]
             state.execution_plan = new_plan
+            state.job_hash = current_job_hash
+            state.job_snapshot = job_dict
 
             # Restore ledger entries as StageEntry objects
             if state.stage_ledger:
@@ -172,10 +197,14 @@ class Orchestrator:
                 from pipeline_transcriber.stages.finalize import FinalizeReportStage
                 finalizer = FinalizeReportStage()
                 finalizer.run(ctx, job_status=job_status)
+                state.finalization_status = "success"
             except Exception as finalize_exc:
+                state.finalization_status = "failed"
                 log.error("finalize_failed", error=str(finalize_exc))
+            state._save()
 
-            log.info("job_finished", status=job_status)
+            log.info("job_finished", status=job_status,
+                     finalization_status=state.finalization_status)
 
         return job_status
 
@@ -240,6 +269,7 @@ class Orchestrator:
                 attempts=attempts_used,
                 duration_ms=duration_ms,
                 error=error_msg,
+                error_type=type(exc).__name__,
             ))
 
             log.error("stage_failed", stage=stage_name,
@@ -442,7 +472,8 @@ class Orchestrator:
             if final_path.exists():
                 try:
                     existing = json.loads(final_path.read_text())
-                    if isinstance(existing.get("segments"), list) and existing["segments"]:
+                    # Check for keys that only ExportStage writes
+                    if any(k in existing for k in ("pipeline", "audio", "artifacts")):
                         skip_final = True
                 except (json.JSONDecodeError, OSError):
                     pass  # Corrupt — overwrite with minimal

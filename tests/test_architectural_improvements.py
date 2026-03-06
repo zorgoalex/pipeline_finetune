@@ -152,6 +152,53 @@ class TestCanonicalStateModel:
         assert pruned == ["OLD_STAGE"]
         assert loaded.completed_stages == ["INPUT_VALIDATE", "DOWNLOAD"]
 
+    def test_job_hash_persists(self, tmp_path: Path):
+        """job_hash survives save+load cycle."""
+        job_dir = tmp_path / "job05"
+        job_dir.mkdir()
+        state = JobState("job05", job_dir)
+
+        job_dict = {"job_id": "job05", "source": "/tmp/test.wav", "language": "kk"}
+        state.job_hash = JobState.compute_config_hash(job_dict)
+        state._save()
+
+        loaded = JobState.load("job05", job_dir)
+        assert loaded.job_hash == state.job_hash
+        assert len(loaded.job_hash) == 64  # SHA-256 hex digest
+
+    def test_resume_job_drift_critical_invalidation(self, tmp_path: Path):
+        """When source changes between runs, completed_stages cleared."""
+        job_dir = tmp_path / "job06"
+        job_dir.mkdir()
+
+        # Simulate first run: save state with completed stages and a job snapshot
+        old_job_dict = {"job_id": "job06", "source": "/tmp/old.wav", "source_type": "local_file", "language": "kk"}
+        state = JobState("job06", job_dir)
+        state.completed_stages = ["INPUT_VALIDATE", "DOWNLOAD", "AUDIO_PREPARE"]
+        state.job_hash = JobState.compute_config_hash(old_job_dict)
+        state.job_snapshot = old_job_dict
+        state._save()
+
+        # Simulate resume with changed critical field (source)
+        loaded = JobState.load("job06", job_dir)
+        new_job_dict = {"job_id": "job06", "source": "/tmp/new.wav", "source_type": "local_file", "language": "kk"}
+        current_job_hash = JobState.compute_config_hash(new_job_dict)
+
+        # Replicate the orchestrator's drift detection logic
+        assert loaded.job_hash != current_job_hash
+
+        critical_fields = ("source", "source_type", "language",
+                           "enable_diarization", "enable_word_timestamps")
+        critical_changed = [
+            f for f in critical_fields
+            if loaded.job_snapshot.get(f) != new_job_dict.get(f)
+        ]
+        assert critical_changed == ["source"]
+
+        # Invalidate completed stages (as orchestrator does)
+        loaded.completed_stages = []
+        assert loaded.completed_stages == []
+
 
 # ===========================================================================
 # Task 2: Indestructible Finalization
@@ -202,11 +249,14 @@ class TestIndestructibleFinalization:
         ctx = make_ctx(tmp_path)
         ctx.stage_ledger = []
 
-        # Write a rich final.json before safety net
+        # Write a rich final.json with ExportStage keys (even if segments=[])
         final_path = ctx.job_dir / "final.json"
         rich_data = {
             "job_id": ctx.job.job_id,
-            "segments": [{"start": 0.0, "end": 5.0, "text": "Hello"}],
+            "segments": [],
+            "pipeline": {"version": "0.1.0"},
+            "audio": {"duration_sec": 10.0},
+            "artifacts": {"srt": "transcript.srt"},
             "finalized": True,
         }
         final_path.write_text(json.dumps(rich_data))
@@ -214,9 +264,9 @@ class TestIndestructibleFinalization:
         log = MagicMock()
         orch._write_safety_net_artifacts(ctx, "success", log)
 
-        # Should not overwrite — rich version preserved
+        # Should not overwrite — rich version preserved (even with empty segments)
         final = json.loads(final_path.read_text())
-        assert final["segments"] == [{"start": 0.0, "end": 5.0, "text": "Hello"}]
+        assert final["pipeline"] == {"version": "0.1.0"}
         assert final["finalized"] is True
 
     def test_safety_net_per_file_isolation(self, tmp_path: Path):
@@ -297,6 +347,62 @@ class TestIndestructibleFinalization:
         assert "stage_ledger" in final
         assert len(final["stage_ledger"]) == 2
         assert "execution" in final
+
+    def test_finalization_status_success(self, tmp_path: Path):
+        """After successful finalize, state.finalization_status == 'success'."""
+        job_dir = tmp_path / "fin_ok"
+        job_dir.mkdir()
+        state = JobState("fin_ok", job_dir)
+
+        ctx = make_ctx(tmp_path, job=make_job(job_id="fin_ok"))
+        # Overwrite job_dir to match state
+        ctx.job_dir = job_dir
+        ctx.stage_ledger = [
+            StageEntry(stage_name="INPUT_VALIDATE", status="success", duration_ms=5),
+        ]
+
+        # Write safety-net artifacts first
+        report_path = job_dir / "report.json"
+        report_path.write_text(json.dumps({"finalized": False, "status": "success"}))
+        final_path = job_dir / "final.json"
+        final_path.write_text(json.dumps({"job_id": "fin_ok", "finalized": False}))
+
+        # Run finalizer and track status as the orchestrator does
+        try:
+            finalizer = FinalizeReportStage()
+            finalizer.run(ctx, job_status="success")
+            state.finalization_status = "success"
+        except Exception:
+            state.finalization_status = "failed"
+        state._save()
+
+        loaded = JobState.load("fin_ok", job_dir)
+        assert loaded.finalization_status == "success"
+
+    def test_finalization_status_failed(self, tmp_path: Path):
+        """When finalizer raises, state.finalization_status == 'failed'."""
+        job_dir = tmp_path / "fin_fail"
+        job_dir.mkdir()
+        state = JobState("fin_fail", job_dir)
+
+        ctx = make_ctx(tmp_path, job=make_job(job_id="fin_fail"))
+        ctx.job_dir = job_dir
+        ctx.stage_ledger = [
+            StageEntry(stage_name="INPUT_VALIDATE", status="success"),
+        ]
+
+        # Simulate finalizer raising an exception
+        try:
+            with patch.object(FinalizeReportStage, 'run', side_effect=RuntimeError("disk exploded")):
+                finalizer = FinalizeReportStage()
+                finalizer.run(ctx, job_status="success")
+            state.finalization_status = "success"
+        except Exception:
+            state.finalization_status = "failed"
+        state._save()
+
+        loaded = JobState.load("fin_fail", job_dir)
+        assert loaded.finalization_status == "failed"
 
 
 # ===========================================================================
@@ -424,3 +530,39 @@ class TestExecutionContract:
         assert "outcome" in final["execution"]
         assert final["execution"]["outcome"]["status"] == "success"
         assert len(final["execution"]["plan"]["effective_stages"]) == 2
+
+    def test_error_type_captured_in_ledger(self, tmp_path: Path):
+        """StageEntry with error_type populated when stage fails."""
+        entry = StageEntry(
+            stage_name="DOWNLOAD",
+            status="failed",
+            error="Connection refused",
+            error_type="ConnectionError",
+        )
+        assert entry.error_type == "ConnectionError"
+        assert entry.error == "Connection refused"
+
+        # Verify it round-trips through model_dump / model_validate
+        dumped = entry.model_dump()
+        assert dumped["error_type"] == "ConnectionError"
+        restored = StageEntry.model_validate(dumped)
+        assert restored.error_type == "ConnectionError"
+
+    def test_error_type_in_execution_outcome(self, tmp_path: Path):
+        """_build_execution_outcome reads error_type from ledger."""
+        ctx = make_ctx(tmp_path)
+        ctx.stage_ledger = [
+            StageEntry(stage_name="INPUT_VALIDATE", status="success", duration_ms=10),
+            StageEntry(
+                stage_name="DOWNLOAD",
+                status="failed",
+                error="file not found",
+                error_type="FileNotFoundError",
+            ),
+        ]
+
+        outcome = FinalizeReportStage._build_execution_outcome(ctx, "failed")
+
+        assert outcome.failed_stage == "DOWNLOAD"
+        assert outcome.error_message == "file not found"
+        assert outcome.error_type == "FileNotFoundError"

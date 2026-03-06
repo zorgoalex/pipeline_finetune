@@ -124,6 +124,7 @@ class FinalizeReportStage(BaseStage):
             if entry.status == "failed" and failed_stage is None:
                 failed_stage = entry.stage_name
                 error_message = entry.error
+                error_type = getattr(entry, "error_type", None)
 
         # Derive timings_type and speaker info from final.json if available
         timings_type = None

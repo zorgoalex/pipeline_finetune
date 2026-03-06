@@ -78,6 +78,7 @@ class StageEntry(BaseModel):
     validation_summary: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
+    error_type: str | None = None  # exception class name
     artifacts: list[str] = Field(default_factory=list)
     skip_reason: str | None = None  # "resumed" for skipped-on-resume
 
