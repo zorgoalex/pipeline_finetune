@@ -1,7 +1,9 @@
 """Job state management for checkpointing/resume."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,10 @@ class JobState:
         self.failed_stages: dict[str, dict[str, Any]] = {}
         self.stage_ledger: list[dict[str, Any]] = []
         self.updated_at: str | None = None
+        # Canonical state fields
+        self.execution_plan: list[str] = []
+        self.config_hash: str = ""
+        self.job_snapshot: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Stage lifecycle
@@ -67,7 +73,7 @@ class JobState:
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
-        """Write current state to *state.json*."""
+        """Write current state to *state.json* atomically via tmp + os.replace."""
         self.updated_at = datetime.now(timezone.utc).isoformat()
         self.job_dir.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -78,9 +84,18 @@ class JobState:
             "stage_attempts": self.stage_attempts,
             "failed_stages": self.failed_stages,
             "stage_ledger": self.stage_ledger,
+            "execution_plan": self.execution_plan,
+            "config_hash": self.config_hash,
+            "job_snapshot": self.job_snapshot,
             "updated_at": self.updated_at,
         }
-        self.state_path.write_text(json.dumps(payload, indent=2) + "\n")
+        tmp_path = self.state_path.with_suffix(".json.tmp")
+        try:
+            tmp_path.write_text(json.dumps(payload, indent=2) + "\n")
+            os.replace(tmp_path, self.state_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     @classmethod
     def load(cls, job_id: str, job_dir: Path) -> JobState:
@@ -95,5 +110,14 @@ class JobState:
             state.stage_attempts = data.get("stage_attempts", {})
             state.failed_stages = data.get("failed_stages", {})
             state.stage_ledger = data.get("stage_ledger", [])
+            state.execution_plan = data.get("execution_plan", [])
+            state.config_hash = data.get("config_hash", "")
+            state.job_snapshot = data.get("job_snapshot", {})
             state.updated_at = data.get("updated_at")
         return state
+
+    @staticmethod
+    def compute_config_hash(config_dict: dict[str, Any]) -> str:
+        """SHA-256 hash of serialized config for drift detection."""
+        serialized = json.dumps(config_dict, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode()).hexdigest()

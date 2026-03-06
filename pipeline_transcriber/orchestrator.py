@@ -15,6 +15,7 @@ from pipeline_transcriber.models.stage import (
     StageStatus, StageValidationError, StageEntry, compute_job_status,
 )
 from pipeline_transcriber.models.alert import AlertSeverity
+from pipeline_transcriber.models.execution import ExecutionPlan
 from pipeline_transcriber.stages import build_stage_sequence
 from pipeline_transcriber.stages.base import BaseStage, StageContext
 from pipeline_transcriber.utils.state import JobState
@@ -85,20 +86,66 @@ class Orchestrator:
         )
 
         stages = build_stage_sequence(job_config, job)
+        new_plan = [s.stage_name.value for s in stages]
+
+        # Save canonical state fields
+        if not resume:
+            state.execution_plan = new_plan
+            state.config_hash = JobState.compute_config_hash(
+                job_config.model_dump(mode="json"),
+            )
+            state.job_snapshot = job.model_dump(mode="json")
+        else:
+            # Check for config drift
+            current_hash = JobState.compute_config_hash(
+                job_config.model_dump(mode="json"),
+            )
+            if state.config_hash and state.config_hash != current_hash:
+                log.warning("resume_config_drift",
+                            old_hash=state.config_hash[:12],
+                            new_hash=current_hash[:12])
+
+            # Intersect completed_stages with new execution plan
+            old_completed = set(state.completed_stages)
+            new_plan_set = set(new_plan)
+            removed = old_completed - new_plan_set
+            if removed:
+                log.warning("resume_stages_pruned", removed=sorted(removed))
+            state.completed_stages = [
+                s for s in state.completed_stages if s in new_plan_set
+            ]
+            state.execution_plan = new_plan
+
+            # Restore ledger entries as StageEntry objects
+            if state.stage_ledger:
+                ctx.stage_ledger = [
+                    StageEntry.model_validate(entry)
+                    for entry in state.stage_ledger
+                ]
+
+        # Build execution contract (requested + effective)
+        ctx.execution_plan = self._build_execution_plan(job, job_config, new_plan)
 
         # Hydrate ctx fields for completed stages on resume
         if resume and state.completed_stages:
             self._hydrate_completed_stages(stages, ctx, state, log)
 
+        # Track which stages have restored ledger entries
+        restored_stages = {e.stage_name for e in ctx.stage_ledger}
+
         try:
             for stage in stages:
                 if resume and stage.stage_name.value in state.completed_stages:
-                    log.info("stage_skipped_resume", stage=stage.stage_name.value)
-                    ctx.stage_ledger.append(StageEntry(
-                        stage_name=stage.stage_name.value,
-                        status="skipped",
-                        skip_reason="resumed",
-                    ))
+                    # Only add skip entry if not already in restored ledger
+                    if stage.stage_name.value not in restored_stages:
+                        log.info("stage_skipped_resume", stage=stage.stage_name.value)
+                        ctx.stage_ledger.append(StageEntry(
+                            stage_name=stage.stage_name.value,
+                            status="skipped",
+                            skip_reason="resumed",
+                        ))
+                    else:
+                        log.info("stage_skipped_resume", stage=stage.stage_name.value)
                     continue
 
                 stage_result = self._run_stage(stage, ctx, state, log)
@@ -117,7 +164,10 @@ class Orchestrator:
             state.set_ledger([e.model_dump() for e in ctx.stage_ledger])
             state.mark_job_finished(job_status)
 
-            # Run FinalizeReportStage outside the pipeline sequence
+            # Phase 1: Safety-net artifacts (individual try/except per file)
+            self._write_safety_net_artifacts(ctx, job_status, log)
+
+            # Phase 2: Full finalizer enriches artifacts
             try:
                 from pipeline_transcriber.stages.finalize import FinalizeReportStage
                 finalizer = FinalizeReportStage()
@@ -278,6 +328,134 @@ class Orchestrator:
         if name in (StageName.SPEAKER_DIARIZATION, StageName.SPEAKER_ASSIGNMENT):
             return not job.enable_diarization
         return False
+
+    # ------------------------------------------------------------------
+    # Execution contract
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_execution_plan(
+        job: Job, config: PipelineConfig, stage_names: list[str],
+    ) -> ExecutionPlan:
+        """Build the execution plan from job request + resolved config."""
+        # Requested
+        requested_speakers = None
+        if job.expected_speakers is not None:
+            requested_speakers = {
+                "min": job.expected_speakers.min,
+                "max": job.expected_speakers.max,
+            }
+
+        # Effective output formats
+        effective_formats = (
+            list(job.output_formats) if job.output_formats
+            else (list(config.export.formats) if config.export.formats
+                  else ["json", "srt", "vtt", "txt"])
+        )
+
+        # Effective speaker bounds
+        effective_bounds = None
+        if config.diarization.enabled and job.enable_diarization:
+            if job.expected_speakers is not None:
+                effective_bounds = {
+                    "min": job.expected_speakers.min,
+                    "max": job.expected_speakers.max,
+                    "source": "job",
+                }
+            else:
+                effective_bounds = {
+                    "min": config.diarization.min_speakers,
+                    "max": config.diarization.max_speakers,
+                    "source": "config",
+                }
+
+        return ExecutionPlan(
+            requested_output_formats=list(job.output_formats),
+            requested_diarization=job.enable_diarization,
+            requested_word_timestamps=job.enable_word_timestamps,
+            requested_speakers=requested_speakers,
+            requested_language=job.language,
+            effective_output_formats=effective_formats,
+            effective_stages=stage_names,
+            effective_speaker_bounds=effective_bounds,
+            effective_alignment_enabled=(
+                config.alignment.enabled and job.enable_word_timestamps
+            ),
+            effective_diarization_enabled=(
+                config.diarization.enabled and job.enable_diarization
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Safety-net finalization
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _atomic_write_json(path: Path, data: dict) -> None:
+        """Write JSON atomically via tmp + os.replace."""
+        import os as _os
+        tmp = path.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+            _os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    def _write_safety_net_artifacts(
+        self, ctx: StageContext, job_status: str, log: Any,
+    ) -> None:
+        """Write bare-minimum artifacts before full finalizer runs.
+
+        Each file write is independent — one failure does not block others.
+        The full FinalizeReportStage will enrich these with complete data.
+        """
+        stage_summaries = [
+            {
+                "stage": e.stage_name,
+                "status": e.status,
+                "attempts": e.attempts,
+                "duration_ms": e.duration_ms,
+                "error": e.error,
+                "skip_reason": e.skip_reason,
+            }
+            for e in ctx.stage_ledger
+        ]
+
+        # Safety-net report.json
+        try:
+            report_path = ctx.job_dir / "report.json"
+            self._atomic_write_json(report_path, {
+                "job_id": ctx.job.job_id,
+                "batch_id": ctx.batch_id,
+                "status": job_status,
+                "stages": stage_summaries,
+                "finalized": False,
+            })
+        except Exception as exc:
+            log.error("safety_net_report_failed", error=str(exc))
+
+        # Safety-net final.json — skip if ExportStage already wrote a rich version
+        try:
+            final_path = ctx.job_dir / "final.json"
+            skip_final = False
+            if final_path.exists():
+                try:
+                    existing = json.loads(final_path.read_text())
+                    if isinstance(existing.get("segments"), list) and existing["segments"]:
+                        skip_final = True
+                except (json.JSONDecodeError, OSError):
+                    pass  # Corrupt — overwrite with minimal
+            if not skip_final:
+                self._atomic_write_json(final_path, {
+                    "job_id": ctx.job.job_id,
+                    "status": job_status,
+                    "source": ctx.job.source,
+                    "source_type": ctx.job.source_type,
+                    "finalized": False,
+                })
+        except Exception as exc:
+            log.error("safety_net_final_failed", error=str(exc))
 
     # ------------------------------------------------------------------
     # Resume hydration

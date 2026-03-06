@@ -6,6 +6,7 @@ from typing import Any
 import structlog
 
 from pipeline_transcriber.models.config import PipelineConfig
+from pipeline_transcriber.models.execution import ExecutionPlan
 from pipeline_transcriber.models.job import Job
 from pipeline_transcriber.models.stage import StageName, StageEntry, StageResult, ValidationResult
 
@@ -20,6 +21,7 @@ class StageContext:
     trace_id: str
     stage_outputs: dict[str, StageResult] = field(default_factory=dict)
     stage_ledger: list[StageEntry] = field(default_factory=list)
+    execution_plan: ExecutionPlan | None = None
     # Typed inter-stage data
     download_output_path: Path | None = None
     audio_path: Path | None = None
