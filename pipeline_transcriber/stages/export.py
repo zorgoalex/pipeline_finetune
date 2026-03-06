@@ -34,7 +34,8 @@ class ExportStage(BaseStage):
 
         if "json" in requested_formats:
             final_path = ctx.job_dir / "final.json"
-            final_path.write_text(json.dumps(source, indent=2, ensure_ascii=False))
+            final_data = self._build_final_json(ctx, source, segments)
+            final_path.write_text(json.dumps(final_data, indent=2, ensure_ascii=False))
             artifacts.append(str(final_path))
 
         if "txt" in requested_formats:
@@ -76,12 +77,69 @@ class ExportStage(BaseStage):
             vtt_path.write_text("\n".join(vtt_lines), encoding="utf-8")
             artifacts.append(str(vtt_path))
 
+        # Copy RTTM to job dir if diarization produced one
+        rttm_path = ctx.artifacts_dir / "diarization" / "diarization_raw.rttm"
+        if rttm_path.exists():
+            import shutil
+            dest_rttm = ctx.job_dir / "diarization.rttm"
+            shutil.copy2(rttm_path, dest_rttm)
+            artifacts.append(str(dest_rttm))
+
         log.info("export_complete", num_formats=len(requested_formats), formats=requested_formats)
         return StageResult(
             status=StageStatus.SUCCESS,
             artifacts=artifacts,
             metrics={"num_formats": len(requested_formats), "num_segments": len(segments)},
         )
+
+    def _build_final_json(self, ctx: StageContext, source: dict, segments: list) -> dict:
+        """Build full final.json per spec section 9."""
+        # Collect speaker stats
+        speakers: dict[str, dict] = {}
+        for seg in segments:
+            spk = seg.get("speaker")
+            if spk and spk != "UNKNOWN":
+                if spk not in speakers:
+                    speakers[spk] = {"id": spk, "total_duration": 0.0, "num_segments": 0}
+                speakers[spk]["total_duration"] += seg.get("end", 0) - seg.get("start", 0)
+                speakers[spk]["num_segments"] += 1
+
+        has_words = any(seg.get("words") for seg in segments)
+        diar_enabled = ctx.config.diarization.enabled and ctx.job.enable_diarization
+
+        # Audio info from probe if available
+        audio_info = {"duration_sec": None, "sample_rate": None, "channels": None}
+        probe_path = ctx.artifacts_dir / "audio" / "audio_probe.json"
+        if probe_path.exists():
+            probe = json.loads(probe_path.read_text())
+            audio_info = {
+                "duration_sec": probe.get("duration_sec"),
+                "sample_rate": probe.get("sample_rate"),
+                "channels": probe.get("channels"),
+            }
+
+        return {
+            "job_id": ctx.job.job_id,
+            "status": "success",
+            "source": ctx.job.source,
+            "source_type": ctx.job.source_type,
+            "language": source.get("language", ctx.job.language),
+            "model": ctx.config.asr.model_name,
+            "device": ctx.config.asr.device,
+            "timings_type": "word" if has_words else "segment",
+            "diarization_enabled": diar_enabled,
+            "audio": audio_info,
+            "speakers": list(speakers.values()),
+            "segments": segments,
+            "artifacts": {
+                "srt": "transcript.srt",
+                "vtt": "transcript.vtt",
+                "txt": "transcript.txt",
+            },
+            "pipeline": {
+                "version": "0.1.0",
+            },
+        }
 
     def validate(self, ctx: StageContext, result: StageResult) -> ValidationResult:
         checks: list[CheckResult] = []
