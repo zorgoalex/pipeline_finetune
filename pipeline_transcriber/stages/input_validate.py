@@ -36,6 +36,43 @@ class InputValidateStage(BaseStage):
         if not ctx.job.output_formats:
             warnings.append("No output_formats specified; defaults will be used.")
 
+        # Strict preflight: job requesting capability disabled by config → FAIL
+        if ctx.job.enable_word_timestamps and not ctx.config.alignment.enabled:
+            return StageResult(
+                status=StageStatus.FAILED,
+                warnings=["Job requests word timestamps but alignment is disabled in config."],
+            )
+
+        if ctx.job.enable_diarization and not ctx.config.diarization.enabled:
+            return StageResult(
+                status=StageStatus.FAILED,
+                warnings=["Job requests diarization but diarization is disabled in config."],
+            )
+
+        # Validate output_formats values
+        valid_formats = {"json", "srt", "vtt", "txt"}
+        if ctx.job.output_formats:
+            invalid = set(ctx.job.output_formats) - valid_formats
+            if invalid:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    warnings=[f"Invalid output_formats: {sorted(invalid)}. Valid: {sorted(valid_formats)}"],
+                )
+
+        # Validate expected_speakers bounds
+        if ctx.job.expected_speakers is not None:
+            es = ctx.job.expected_speakers
+            if es.min < 1:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    warnings=[f"expected_speakers.min must be >= 1, got {es.min}"],
+                )
+            if es.max < es.min:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    warnings=[f"expected_speakers.max ({es.max}) must be >= min ({es.min})"],
+                )
+
         log.info("stage_succeeded")
         return StageResult(status=StageStatus.SUCCESS, warnings=warnings)
 

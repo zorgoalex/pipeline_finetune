@@ -28,7 +28,10 @@ class ExportStage(BaseStage):
         segments = source.get("segments", [])
 
         export_cfg = ctx.config.export
-        requested_formats = export_cfg.formats if export_cfg.formats else ["json", "srt", "vtt", "txt"]
+        requested_formats = (
+            ctx.job.output_formats if ctx.job.output_formats
+            else (export_cfg.formats if export_cfg.formats else ["json", "srt", "vtt", "txt"])
+        )
 
         artifacts: list[str] = []
 
@@ -172,7 +175,10 @@ class ExportStage(BaseStage):
             "srt": "transcript.srt",
             "vtt": "transcript.vtt",
         }
-        requested = ctx.config.export.formats if ctx.config.export.formats else list(format_map.keys())
+        requested = (
+            ctx.job.output_formats if ctx.job.output_formats
+            else (ctx.config.export.formats if ctx.config.export.formats else list(format_map.keys()))
+        )
         for fmt in requested:
             fname = format_map.get(fmt)
             if fname is None:

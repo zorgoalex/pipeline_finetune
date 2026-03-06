@@ -86,6 +86,10 @@ class Orchestrator:
 
         stages = build_stage_sequence(job_config, job)
 
+        # Hydrate ctx fields for completed stages on resume
+        if resume and state.completed_stages:
+            self._hydrate_completed_stages(stages, ctx, state, log)
+
         try:
             for stage in stages:
                 if resume and stage.stage_name.value in state.completed_stages:
@@ -274,6 +278,114 @@ class Orchestrator:
         if name in (StageName.SPEAKER_DIARIZATION, StageName.SPEAKER_ASSIGNMENT):
             return not job.enable_diarization
         return False
+
+    # ------------------------------------------------------------------
+    # Resume hydration
+    # ------------------------------------------------------------------
+
+    # Maps stage_name -> list of (relative_artifact_path, ctx_field_name)
+    # Special loaders are handled by type in _hydrate_stage_artifact.
+    _HYDRATION_MAP: dict[str, list[tuple[str, str]]] = {
+        "DOWNLOAD": [("artifacts/raw", "download_output_path")],
+        "AUDIO_PREPARE": [("artifacts/audio/audio_16k_mono.wav", "audio_path")],
+        "VAD_SEGMENTATION": [("artifacts/vad/vad_segments.json", "vad_segments")],
+        "ASR_TRANSCRIPTION": [("artifacts/asr/raw_asr.json", "asr_result")],
+        "ALIGNMENT": [("artifacts/alignment/aligned_result.json", "aligned_result")],
+        "SPEAKER_DIARIZATION": [("artifacts/diarization/diarization_segments.json", "diarization_result")],
+        "SPEAKER_ASSIGNMENT": [("artifacts/fusion/fused_result.json", "fused_result")],
+    }
+
+    def _hydrate_completed_stages(
+        self, stages: list[BaseStage], ctx: StageContext,
+        state: JobState, log: Any,
+    ) -> None:
+        """Hydrate StageContext from disk artifacts for completed stages.
+
+        Uses cascade invalidation: if stage N's artifact is missing/corrupt,
+        stages N+1..M are also removed from completed_stages.
+        """
+        stage_order = [s.stage_name.value for s in stages]
+        invalidated = False
+
+        for stage_name in stage_order:
+            if stage_name not in state.completed_stages:
+                continue
+
+            if invalidated:
+                state.completed_stages.remove(stage_name)
+                log.warning("resume_cascade_invalidated", stage=stage_name)
+                continue
+
+            if not self._hydrate_stage_artifact(stage_name, ctx, log):
+                state.completed_stages.remove(stage_name)
+                invalidated = True
+                log.warning("resume_rerun_required", stage=stage_name,
+                            reason="artifact_missing_or_corrupt")
+
+    def _hydrate_stage_artifact(
+        self, stage_name: str, ctx: StageContext, log: Any,
+    ) -> bool:
+        """Load a single stage's artifacts into ctx. Returns True on success."""
+        entries = self._HYDRATION_MAP.get(stage_name, [])
+        if not entries:
+            return True  # No artifacts to hydrate (e.g. INPUT_VALIDATE)
+
+        for rel_path, ctx_field in entries:
+            artifact_path = ctx.job_dir / rel_path
+
+            try:
+                if ctx_field == "download_output_path":
+                    value = self._find_download_file(artifact_path)
+                elif ctx_field == "audio_path":
+                    value = artifact_path if artifact_path.exists() else None
+                elif ctx_field == "diarization_result":
+                    value = self._load_diarization_result(artifact_path)
+                else:
+                    # Generic JSON loader
+                    if not artifact_path.exists():
+                        value = None
+                    else:
+                        value = json.loads(artifact_path.read_text())
+            except (json.JSONDecodeError, OSError) as exc:
+                log.warning("resume_artifact_corrupt", stage=stage_name,
+                            path=str(artifact_path), error=str(exc))
+                return False
+
+            if value is None:
+                log.warning("resume_artifact_missing", stage=stage_name,
+                            path=str(artifact_path))
+                return False
+
+            setattr(ctx, ctx_field, value)
+            log.debug("resume_hydrated", stage=stage_name, field=ctx_field)
+
+        return True
+
+    @staticmethod
+    def _find_download_file(raw_dir: Path) -> Path | None:
+        """Find the downloaded media file in artifacts/raw/."""
+        if not raw_dir.is_dir():
+            return None
+        media_files = [f for f in raw_dir.iterdir()
+                       if f.is_file() and f.suffix != ".json"]
+        if not media_files:
+            return None
+        if len(media_files) > 1:
+            # Pick most recently modified
+            return max(media_files, key=lambda f: f.stat().st_mtime)
+        return media_files[0]
+
+    @staticmethod
+    def _load_diarization_result(segments_path: Path) -> dict | None:
+        """Load diarization result, reconstructing the expected dict structure."""
+        if not segments_path.exists():
+            return None
+        segments = json.loads(segments_path.read_text())
+        speakers_seen = {s.get("speaker") for s in segments if s.get("speaker")}
+        return {
+            "segments": segments,
+            "num_speakers": len(speakers_seen),
+        }
 
     def _build_batch_report(self, jobs: list[Job]) -> dict[str, Any]:
         success = sum(1 for s in self.results.values() if s == "success")

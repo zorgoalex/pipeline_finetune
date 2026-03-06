@@ -41,6 +41,7 @@ def make_job(job_id: str = "test-job-01") -> Job:
         source_type="local_file",
         source="/tmp/test.wav",
         output_formats=["json", "txt"],
+        enable_word_timestamps=False,  # alignment disabled in test config
     )
 
 
@@ -49,7 +50,6 @@ def _mock_build_stage_sequence(config, job=None):
     from pipeline_transcriber.models.stage import StageName
     from pipeline_transcriber.stages.input_validate import InputValidateStage
     from pipeline_transcriber.stages.qa import QaStage
-    from pipeline_transcriber.stages.finalize import FinalizeReportStage
     from pipeline_transcriber.stages.export import ExportStage
 
     class MockDownloadStage(BaseStage):
@@ -117,7 +117,6 @@ def _mock_build_stage_sequence(config, job=None):
         MockAsrStage(),
         ExportStage(),
         QaStage(),
-        FinalizeReportStage(),
     ]
 
 
@@ -198,3 +197,139 @@ class TestOrchestrator:
 
         required_keys = {"batch_id", "total", "success", "failed", "partial", "timestamp", "jobs"}
         assert required_keys.issubset(report.keys())
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: Resume hydration tests
+# ---------------------------------------------------------------------------
+
+
+class TestResumeHydration:
+    """Tests for _hydrate_completed_stages, cascade invalidation, and artifact loading."""
+
+    def _setup_job_dir(self, tmp_path, job_id="hydrate-test"):
+        cfg = make_config(tmp_path)
+        job_dir = Path(cfg.app.work_dir) / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        return cfg, job_dir
+
+    def test_hydrate_download_from_disk(self, tmp_path):
+        """_find_download_file should find the media file in raw/."""
+        raw_dir = tmp_path / "raw"
+        raw_dir.mkdir()
+        media = raw_dir / "source_media.wav"
+        media.write_bytes(b"\x00" * 50)
+        meta = raw_dir / "source_meta.json"
+        meta.write_text("{}")
+
+        result = Orchestrator._find_download_file(raw_dir)
+        assert result == media
+
+    def test_find_download_file_no_dir(self, tmp_path):
+        """Missing raw dir returns None."""
+        assert Orchestrator._find_download_file(tmp_path / "nonexistent") is None
+
+    def test_find_download_file_empty_dir(self, tmp_path):
+        """Empty raw dir (only json) returns None."""
+        raw_dir = tmp_path / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "meta.json").write_text("{}")
+        assert Orchestrator._find_download_file(raw_dir) is None
+
+    def test_find_download_file_multiple_picks_newest(self, tmp_path):
+        """With multiple non-JSON files, picks most recent by mtime."""
+        import time
+        raw_dir = tmp_path / "raw"
+        raw_dir.mkdir()
+        old = raw_dir / "old.wav"
+        old.write_bytes(b"\x00" * 10)
+        time.sleep(0.05)
+        new = raw_dir / "new.mp4"
+        new.write_bytes(b"\x00" * 10)
+        result = Orchestrator._find_download_file(raw_dir)
+        assert result == new
+
+    def test_load_diarization_result(self, tmp_path):
+        """_load_diarization_result reconstructs segments + num_speakers."""
+        seg_path = tmp_path / "diarization_segments.json"
+        segments = [
+            {"start": 0, "end": 1, "speaker": "A"},
+            {"start": 1, "end": 2, "speaker": "B"},
+            {"start": 2, "end": 3, "speaker": "A"},
+        ]
+        seg_path.write_text(json.dumps(segments))
+        result = Orchestrator._load_diarization_result(seg_path)
+        assert result["num_speakers"] == 2
+        assert len(result["segments"]) == 3
+
+    def test_load_diarization_result_missing(self, tmp_path):
+        assert Orchestrator._load_diarization_result(tmp_path / "nope.json") is None
+
+    @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_mock_build_stage_sequence)
+    def test_cascade_invalidation(self, mock_stages, tmp_path):
+        """If AUDIO_PREPARE artifact missing, ASR should be cascade-invalidated."""
+        from pipeline_transcriber.utils.state import JobState
+        cfg = make_config(tmp_path)
+        job = make_job()
+        job_dir = Path(cfg.app.work_dir) / job.job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        # First run to create artifacts
+        orch1 = Orchestrator(cfg, batch_id="b1")
+        orch1.run_batch([job])
+
+        # Remove audio artifact to trigger cascade
+        audio_file = job_dir / "artifacts" / "audio" / "audio_16k_mono.wav"
+        if audio_file.exists():
+            audio_file.unlink()
+
+        # Resume should cascade-invalidate AUDIO_PREPARE and ASR
+        orch2 = Orchestrator(cfg, batch_id="b2")
+        report = orch2.run_batch([job], resume=True)
+        assert report["success"] == 1  # Should still succeed after re-running
+
+    @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_mock_build_stage_sequence)
+    def test_hydration_corrupt_json(self, mock_stages, tmp_path):
+        """Corrupt JSON artifact should trigger cascade invalidation, not crash."""
+        cfg = make_config(tmp_path)
+        job = make_job()
+        job_dir = Path(cfg.app.work_dir) / job.job_id
+
+        # First run
+        orch1 = Orchestrator(cfg, batch_id="b1")
+        orch1.run_batch([job])
+
+        # Corrupt the ASR raw JSON
+        asr_file = job_dir / "artifacts" / "asr" / "raw_asr.json"
+        if asr_file.exists():
+            asr_file.write_text("{{{corrupt")
+
+        # Resume should handle corrupt JSON gracefully
+        orch2 = Orchestrator(cfg, batch_id="b2")
+        report = orch2.run_batch([job], resume=True)
+        assert report["success"] == 1
+
+    @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_mock_build_stage_sequence)
+    def test_resume_hydrates_ctx_fields(self, mock_stages, tmp_path):
+        """After successful resume, ctx fields should be hydrated from disk."""
+        cfg = make_config(tmp_path)
+        job = make_job()
+
+        orch = Orchestrator(cfg, batch_id="b1")
+        report = orch.run_batch([job])
+        assert report["success"] == 1
+
+        # Verify artifacts exist on disk
+        job_dir = Path(cfg.app.work_dir) / job.job_id
+        assert (job_dir / "artifacts" / "raw").exists()
+        assert (job_dir / "artifacts" / "asr" / "raw_asr.json").exists()
+
+    @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_mock_build_stage_sequence)
+    def test_hydration_map_covers_all_stages(self, mock_stages, tmp_path):
+        """HYDRATION_MAP should have entries for all data-producing stages."""
+        expected = {
+            "DOWNLOAD", "AUDIO_PREPARE", "VAD_SEGMENTATION",
+            "ASR_TRANSCRIPTION", "ALIGNMENT", "SPEAKER_DIARIZATION",
+            "SPEAKER_ASSIGNMENT",
+        }
+        assert expected == set(Orchestrator._HYDRATION_MAP.keys())

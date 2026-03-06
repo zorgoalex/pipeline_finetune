@@ -34,6 +34,7 @@ class DiarizeStage(BaseStage):
             raise RuntimeError("No audio path available for diarization")
 
         diar_cfg = ctx.config.diarization
+        effective_min, effective_max = self._effective_speaker_bounds(ctx)
         hf_token = os.environ.get(diar_cfg.hf_token_env_var)
         if not hf_token:
             raise HfTokenError(
@@ -51,11 +52,14 @@ class DiarizeStage(BaseStage):
             "diarization_starting",
             pipeline=diar_cfg.pipeline_name,
             device=device,
-            min_speakers=diar_cfg.min_speakers,
-            max_speakers=diar_cfg.max_speakers,
+            min_speakers=effective_min,
+            max_speakers=effective_max,
+            override_source="job" if ctx.job.expected_speakers else "config",
         )
 
-        diar_segments, num_speakers = self._run_pyannote(ctx, hf_token, device)
+        diar_segments, num_speakers = self._run_pyannote(
+            ctx, hf_token, device, effective_min, effective_max,
+        )
 
         # Save RTTM
         rttm_path = diar_dir / "diarization_raw.rttm"
@@ -74,6 +78,9 @@ class DiarizeStage(BaseStage):
             "num_segments": len(diar_segments),
             "min_speakers_config": diar_cfg.min_speakers,
             "max_speakers_config": diar_cfg.max_speakers,
+            "min_speakers_effective": effective_min,
+            "max_speakers_effective": effective_max,
+            "override_source": "job" if ctx.job.expected_speakers else "config",
         }
         report_path = diar_dir / "diarization_report.json"
         report_path.write_text(json.dumps(report, indent=2))
@@ -96,7 +103,8 @@ class DiarizeStage(BaseStage):
         )
 
     def _run_pyannote(
-        self, ctx: StageContext, hf_token: str, device: str
+        self, ctx: StageContext, hf_token: str, device: str,
+        min_speakers: int, max_speakers: int,
     ) -> tuple[list[dict], int]:
         """Run pyannote diarization pipeline via whisperx."""
         import whisperx
@@ -110,10 +118,10 @@ class DiarizeStage(BaseStage):
         )
 
         diarize_kwargs: dict[str, Any] = {}
-        if diar_cfg.min_speakers > 0:
-            diarize_kwargs["min_speakers"] = diar_cfg.min_speakers
-        if diar_cfg.max_speakers > 0:
-            diarize_kwargs["max_speakers"] = diar_cfg.max_speakers
+        if min_speakers > 0:
+            diarize_kwargs["min_speakers"] = min_speakers
+        if max_speakers > 0:
+            diarize_kwargs["max_speakers"] = max_speakers
 
         audio = whisperx.load_audio(str(ctx.audio_path))
         diarize_result = diarize_model(audio, **diarize_kwargs)
@@ -176,13 +184,14 @@ class DiarizeStage(BaseStage):
             if not has_segments:
                 all_ok = False
 
-            # Check speaker count within configured bounds
-            speakers_ok = diar_cfg.min_speakers <= num_speakers <= diar_cfg.max_speakers
+            # Check speaker count within effective bounds
+            eff_min, eff_max = self._effective_speaker_bounds(ctx)
+            speakers_ok = eff_min <= num_speakers <= eff_max
             checks.append(
                 CheckResult(
                     name="speaker_count_in_range",
                     passed=speakers_ok,
-                    details=f"Found {num_speakers} speakers (expected {diar_cfg.min_speakers}-{diar_cfg.max_speakers}).",
+                    details=f"Found {num_speakers} speakers (expected {eff_min}-{eff_max}).",
                 )
             )
             # Speaker count out of range is a warning, not a failure
@@ -190,6 +199,13 @@ class DiarizeStage(BaseStage):
                 pass  # informational only
 
         return ValidationResult(ok=all_ok, checks=checks)
+
+    def _effective_speaker_bounds(self, ctx: StageContext) -> tuple[int, int]:
+        """Return (min_speakers, max_speakers) using job override if available."""
+        diar_cfg = ctx.config.diarization
+        if ctx.job.expected_speakers is not None:
+            return ctx.job.expected_speakers.min, ctx.job.expected_speakers.max
+        return diar_cfg.min_speakers, diar_cfg.max_speakers
 
     def can_retry(self, error: Exception | None, ctx: StageContext) -> bool:
         if isinstance(error, HfTokenError):

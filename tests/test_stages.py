@@ -124,8 +124,9 @@ class TestStageRuns:
 
         assert (ctx.job_dir / "final.json").exists()
         assert (ctx.job_dir / "transcript.txt").exists()
-        assert (ctx.job_dir / "transcript.srt").exists()
-        assert (ctx.job_dir / "transcript.vtt").exists()
+        # job.output_formats=["json", "txt"], so srt/vtt should NOT be created
+        assert not (ctx.job_dir / "transcript.srt").exists()
+        assert not (ctx.job_dir / "transcript.vtt").exists()
 
     def test_all_stubs_implement_interface(self):
         config = PipelineConfig()
@@ -150,3 +151,226 @@ class TestStageValidation:
         result = stage.run(ctx)
         validation = stage.validate(ctx, result)
         assert validation.ok is True
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: Strict preflight (InputValidateStage) tests
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightValidation:
+    def _make_ctx(self, tmp_path, **job_kwargs):
+        source_file = tmp_path / "test.wav"
+        source_file.write_bytes(b"RIFF" + b"\x00" * 100)
+        defaults = dict(
+            job_id="preflight-test",
+            source_type="local_file",
+            source=str(source_file),
+        )
+        defaults.update(job_kwargs)
+        job = Job(**defaults)
+        config = PipelineConfig()
+        config.app.work_dir = tmp_path / "output"
+        job_dir = tmp_path / "output" / job.job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        return StageContext(job=job, config=config, job_dir=job_dir,
+                           batch_id="test", trace_id="test")
+
+    def test_word_timestamps_without_alignment_fails(self, tmp_path):
+        ctx = self._make_ctx(tmp_path, enable_word_timestamps=True)
+        ctx.config.alignment.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.FAILED
+        assert any("word timestamps" in w for w in result.warnings)
+
+    def test_word_timestamps_with_alignment_ok(self, tmp_path):
+        ctx = self._make_ctx(tmp_path, enable_word_timestamps=True)
+        ctx.config.alignment.enabled = True
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.SUCCESS
+
+    def test_diarization_without_config_fails(self, tmp_path):
+        ctx = self._make_ctx(tmp_path, enable_diarization=True,
+                             enable_word_timestamps=False)
+        ctx.config.diarization.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.FAILED
+        assert any("diarization" in w for w in result.warnings)
+
+    def test_diarization_with_config_ok(self, tmp_path):
+        ctx = self._make_ctx(tmp_path, enable_diarization=True,
+                             enable_word_timestamps=False)
+        ctx.config.diarization.enabled = True
+        ctx.config.alignment.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.SUCCESS
+
+    def test_invalid_output_format_fails(self, tmp_path):
+        ctx = self._make_ctx(tmp_path, output_formats=["json", "mp3"],
+                             enable_word_timestamps=False)
+        ctx.config.alignment.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.FAILED
+        assert any("mp3" in w for w in result.warnings)
+
+    def test_valid_output_formats_ok(self, tmp_path):
+        ctx = self._make_ctx(tmp_path, output_formats=["json", "srt", "vtt", "txt"],
+                             enable_word_timestamps=False)
+        ctx.config.alignment.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.SUCCESS
+
+    def test_expected_speakers_min_zero_fails(self, tmp_path):
+        from pipeline_transcriber.models.job import ExpectedSpeakers
+        ctx = self._make_ctx(tmp_path, enable_word_timestamps=False,
+                             expected_speakers=ExpectedSpeakers(min=0, max=5))
+        ctx.config.alignment.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.FAILED
+        assert any("min" in w for w in result.warnings)
+
+    def test_expected_speakers_max_lt_min_fails(self, tmp_path):
+        from pipeline_transcriber.models.job import ExpectedSpeakers
+        ctx = self._make_ctx(tmp_path, enable_word_timestamps=False,
+                             expected_speakers=ExpectedSpeakers(min=5, max=2))
+        ctx.config.alignment.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.FAILED
+        assert any("max" in w for w in result.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: Job-level output_formats override (ExportStage) tests
+# ---------------------------------------------------------------------------
+
+
+class TestExportFormatsOverride:
+    def _make_ctx(self, tmp_path, output_formats=None):
+        source_file = tmp_path / "test.wav"
+        source_file.write_bytes(b"RIFF" + b"\x00" * 100)
+        job = Job(
+            job_id="export-test",
+            source_type="local_file",
+            source=str(source_file),
+            output_formats=output_formats or [],
+        )
+        config = PipelineConfig()
+        config.app.work_dir = tmp_path / "output"
+        job_dir = tmp_path / "output" / job.job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        return StageContext(job=job, config=config, job_dir=job_dir,
+                           batch_id="test", trace_id="test")
+
+    def test_job_formats_override_config(self, tmp_path):
+        """Job with output_formats=['srt'] should only produce srt + final.json."""
+        ctx = self._make_ctx(tmp_path, output_formats=["srt"])
+        ExportStage().run(ctx)
+        assert (ctx.job_dir / "transcript.srt").exists()
+        assert (ctx.job_dir / "final.json").exists()
+        assert not (ctx.job_dir / "transcript.txt").exists()
+        assert not (ctx.job_dir / "transcript.vtt").exists()
+
+    def test_empty_formats_uses_config_defaults(self, tmp_path):
+        """Empty job.output_formats falls back to config defaults."""
+        ctx = self._make_ctx(tmp_path, output_formats=[])
+        ctx.config.export.formats = ["txt", "vtt"]
+        ExportStage().run(ctx)
+        assert (ctx.job_dir / "transcript.txt").exists()
+        assert (ctx.job_dir / "transcript.vtt").exists()
+        assert not (ctx.job_dir / "transcript.srt").exists()
+
+    def test_validate_respects_job_formats(self, tmp_path):
+        """Validate should check only the job-requested formats."""
+        ctx = self._make_ctx(tmp_path, output_formats=["txt"])
+        stage = ExportStage()
+        result = stage.run(ctx)
+        validation = stage.validate(ctx, result)
+        assert validation.ok is True
+        check_names = [c.name for c in validation.checks]
+        assert "export_format:txt" in check_names
+        assert "export_format:srt" not in check_names
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Job-level expected_speakers override (DiarizeStage) tests
+# ---------------------------------------------------------------------------
+
+
+class TestDiarizeExpectedSpeakers:
+    def test_effective_bounds_from_config(self, tmp_path):
+        """Without job override, bounds come from config."""
+        job = Job(job_id="diar-test", source_type="local_file", source="/tmp/t.wav")
+        config = PipelineConfig()
+        config.diarization.min_speakers = 2
+        config.diarization.max_speakers = 8
+        job_dir = tmp_path / "output" / job.job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        ctx = StageContext(job=job, config=config, job_dir=job_dir,
+                           batch_id="test", trace_id="test")
+        stage = DiarizeStage()
+        mn, mx = stage._effective_speaker_bounds(ctx)
+        assert mn == 2
+        assert mx == 8
+
+    def test_effective_bounds_from_job(self, tmp_path):
+        """Job expected_speakers overrides config."""
+        from pipeline_transcriber.models.job import ExpectedSpeakers
+        job = Job(job_id="diar-test", source_type="local_file", source="/tmp/t.wav",
+                  expected_speakers=ExpectedSpeakers(min=3, max=5))
+        config = PipelineConfig()
+        config.diarization.min_speakers = 1
+        config.diarization.max_speakers = 20
+        job_dir = tmp_path / "output" / job.job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        ctx = StageContext(job=job, config=config, job_dir=job_dir,
+                           batch_id="test", trace_id="test")
+        stage = DiarizeStage()
+        mn, mx = stage._effective_speaker_bounds(ctx)
+        assert mn == 3
+        assert mx == 5
+
+    def test_validate_uses_effective_bounds(self, tmp_path):
+        """Validate checks speaker count against effective bounds, not config."""
+        from pipeline_transcriber.models.job import ExpectedSpeakers
+        from pipeline_transcriber.models.stage import StageResult, StageStatus
+        job = Job(job_id="diar-test", source_type="local_file", source="/tmp/t.wav",
+                  expected_speakers=ExpectedSpeakers(min=2, max=4))
+        config = PipelineConfig()
+        config.diarization.min_speakers = 1
+        config.diarization.max_speakers = 20
+        job_dir = tmp_path / "output" / job.job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        ctx = StageContext(job=job, config=config, job_dir=job_dir,
+                           batch_id="test", trace_id="test")
+        # Simulate diarization output with 3 speakers (within job bounds)
+        ctx.diarization_result = {
+            "segments": [
+                {"start": 0, "end": 1, "speaker": "A"},
+                {"start": 1, "end": 2, "speaker": "B"},
+                {"start": 2, "end": 3, "speaker": "C"},
+            ],
+            "num_speakers": 3,
+        }
+        # Create artifact files so validate's file checks pass
+        diar_dir = ctx.artifacts_dir / "diarization"
+        diar_dir.mkdir(parents=True, exist_ok=True)
+        (diar_dir / "diarization_raw.rttm").write_text("")
+        (diar_dir / "diarization_segments.json").write_text("[]")
+        (diar_dir / "diarization_report.json").write_text("{}")
+
+        stage = DiarizeStage()
+        result = StageResult(status=StageStatus.SUCCESS,
+                             artifacts=[str(diar_dir / f) for f in [
+                                 "diarization_raw.rttm", "diarization_segments.json",
+                                 "diarization_report.json"]])
+        validation = stage.validate(ctx, result)
+        # 3 speakers is within [2,4] — speaker_count_in_range should pass
+        range_check = next(c for c in validation.checks if c.name == "speaker_count_in_range")
+        assert range_check.passed is True
+
+    def test_can_retry_false_for_hf_token_error(self):
+        """HfTokenError is not retryable."""
+        from pipeline_transcriber.stages.diarize import HfTokenError
+        stage = DiarizeStage()
+        assert stage.can_retry(HfTokenError("missing"), None) is False
+        assert stage.can_retry(RuntimeError("other"), None) is True
