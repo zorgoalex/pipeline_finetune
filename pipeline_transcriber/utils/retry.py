@@ -60,10 +60,12 @@ def run_with_retry(
                 and not exc.validation.retry_recommended
             ):
                 log.error("validation_failed_no_retry")
+                exc.attempts_used = attempt  # type: ignore[attr-defined]
                 raise
 
             if not can_retry_func(exc):
                 log.error("non_retryable_error")
+                exc.attempts_used = attempt  # type: ignore[attr-defined]
                 raise
 
             if attempt < retry_config.max_attempts:
@@ -78,7 +80,9 @@ def run_with_retry(
                 log.error("all_attempts_exhausted")
 
     if last_exception is not None:
+        last_exception.attempts_used = retry_config.max_attempts  # type: ignore[attr-defined]
         raise last_exception
+    # Dead code: loop always sets last_exception or returns
     raise RuntimeError(
         f"All {retry_config.max_attempts} attempts exhausted for stage "
         f"{stage_name!r} (job={job_id}, trace={trace_id})"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
@@ -67,3 +67,33 @@ class StageValidationError(Exception):
         self.validation = validation
         failed = [c.name for c in validation.checks if not c.passed]
         super().__init__(f"Stage validation failed: {', '.join(failed)}")
+
+
+class StageEntry(BaseModel):
+    """Single entry in the stage execution ledger — tracks every stage outcome."""
+    stage_name: str
+    status: str  # "success" | "failed" | "skipped"
+    attempts: int = 1
+    duration_ms: int = 0
+    validation_summary: dict[str, Any] | None = None
+    warnings: list[str] = Field(default_factory=list)
+    error: str | None = None
+    artifacts: list[str] = Field(default_factory=list)
+    skip_reason: str | None = None  # "resumed" for skipped-on-resume
+
+
+def compute_job_status(
+    ledger: list[StageEntry],
+    is_optional_func: Callable[[str], bool],
+) -> str:
+    """Derive job status from the stage execution ledger.
+
+    Returns "success", "partial", or "failed".
+    """
+    has_failure = any(e.status == "failed" for e in ledger)
+    if not has_failure:
+        return "success"
+    all_failures_optional = all(
+        is_optional_func(e.stage_name) for e in ledger if e.status == "failed"
+    )
+    return "partial" if all_failures_optional else "failed"

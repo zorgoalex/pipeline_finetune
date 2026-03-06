@@ -49,20 +49,20 @@ class TestBuildStageSequence:
     def test_all_stages_enabled(self):
         config = PipelineConfig()
         stages = build_stage_sequence(config)
-        assert len(stages) == 11
+        assert len(stages) == 10  # FinalizeReportStage runs outside sequence
 
     def test_vad_disabled(self):
         config = PipelineConfig()
         config.vad.enabled = False
         stages = build_stage_sequence(config)
-        assert len(stages) == 10
+        assert len(stages) == 9
         assert not any(isinstance(s, VadStage) for s in stages)
 
     def test_diarization_disabled(self):
         config = PipelineConfig()
         config.diarization.enabled = False
         stages = build_stage_sequence(config)
-        assert len(stages) == 9
+        assert len(stages) == 8
         assert not any(isinstance(s, DiarizeStage) for s in stages)
         assert not any(isinstance(s, AssignSpeakersStage) for s in stages)
 
@@ -70,7 +70,7 @@ class TestBuildStageSequence:
         config = PipelineConfig()
         config.alignment.enabled = False
         stages = build_stage_sequence(config)
-        assert len(stages) == 10
+        assert len(stages) == 9
         assert not any(isinstance(s, AlignStage) for s in stages)
 
     def test_all_optional_disabled(self):
@@ -79,7 +79,7 @@ class TestBuildStageSequence:
         config.alignment.enabled = False
         config.diarization.enabled = False
         stages = build_stage_sequence(config)
-        assert len(stages) == 7
+        assert len(stages) == 6
         stage_names = [s.stage_name for s in stages]
         assert StageName.INPUT_VALIDATE in stage_names
         assert StageName.DOWNLOAD in stage_names
@@ -87,7 +87,7 @@ class TestBuildStageSequence:
         assert StageName.ASR_TRANSCRIPTION in stage_names
         assert StageName.EXPORTER in stage_names
         assert StageName.QA_VALIDATOR in stage_names
-        assert StageName.FINALIZE_REPORT in stage_names
+        # FinalizeReportStage runs outside the sequence (guaranteed via try/finally)
 
 
 # ---------------------------------------------------------------------------

@@ -19,29 +19,31 @@ class FinalizeReportStage(BaseStage):
     def stage_name(self) -> StageName:
         return StageName.FINALIZE_REPORT
 
-    def run(self, ctx: StageContext) -> StageResult:
+    def run(self, ctx: StageContext, job_status: str = "success") -> StageResult:
         log = self._log(ctx)
         log.info("stage_started")
 
+        # Build report from the ledger (single source of truth)
         stage_summaries: list[dict[str, object]] = []
-        for stage_name, stage_result in ctx.stage_outputs.items():
+        for entry in ctx.stage_ledger:
             stage_summaries.append({
-                "stage": stage_name,
-                "status": stage_result.status.value,
-                "num_artifacts": len(stage_result.artifacts),
-                "warnings": stage_result.warnings,
-                "metrics": stage_result.metrics,
+                "stage": entry.stage_name,
+                "status": entry.status,
+                "attempts": entry.attempts,
+                "duration_ms": entry.duration_ms,
+                "warnings": entry.warnings,
+                "artifacts": entry.artifacts,
+                "error": entry.error,
+                "skip_reason": entry.skip_reason,
             })
-
-        all_succeeded = all(s["status"] == "SUCCESS" for s in stage_summaries)
 
         report: dict[str, object] = {
             "job_id": ctx.job.job_id,
             "batch_id": ctx.batch_id,
             "trace_id": ctx.trace_id,
+            "status": job_status,
             "stages": stage_summaries,
             "total_stages": len(stage_summaries),
-            "all_succeeded": all_succeeded,
         }
 
         # Incorporate QA report if available
@@ -58,13 +60,23 @@ class FinalizeReportStage(BaseStage):
         final_path = ctx.job_dir / "final.json"
         if final_path.exists():
             final_data = json.loads(final_path.read_text())
-            final_data["status"] = "success" if all_succeeded else "partial"
+            final_data["status"] = job_status
+            final_data["stage_ledger"] = stage_summaries
             tmp_path = final_path.with_suffix(".json.tmp")
             tmp_path.write_text(json.dumps(final_data, indent=2, ensure_ascii=False))
             os.replace(tmp_path, final_path)
-            log.info("final_json_patched", status=final_data["status"])
+            log.info("final_json_patched", status=job_status)
         else:
-            log.warning("final_json_not_found_for_status_patch")
+            # Create minimal final.json for failed jobs that never reached export
+            minimal = {
+                "job_id": ctx.job.job_id,
+                "status": job_status,
+                "source": ctx.job.source,
+                "source_type": ctx.job.source_type,
+                "stage_ledger": stage_summaries,
+            }
+            final_path.write_text(json.dumps(minimal, indent=2, ensure_ascii=False))
+            log.info("final_json_created_minimal", status=job_status)
 
         log.info("finalize_complete", total_stages=len(stage_summaries))
         return StageResult(

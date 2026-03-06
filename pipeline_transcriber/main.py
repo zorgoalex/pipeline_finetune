@@ -1,6 +1,8 @@
 """CLI entry point for the transcription pipeline."""
 from __future__ import annotations
 
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 import typer
 
@@ -35,8 +37,9 @@ def single(
 ) -> None:
     """Process a single source."""
     cfg = load_config(config)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     job = Job(
-        job_id="single-run",
+        job_id=f"single_{ts}_{uuid.uuid4().hex[:6]}",
         source_type=source_type,
         source=source,
         language=language,

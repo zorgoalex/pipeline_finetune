@@ -32,12 +32,6 @@ class ExportStage(BaseStage):
 
         artifacts: list[str] = []
 
-        if "json" in requested_formats:
-            final_path = ctx.job_dir / "final.json"
-            final_data = self._build_final_json(ctx, source, segments)
-            final_path.write_text(json.dumps(final_data, indent=2, ensure_ascii=False))
-            artifacts.append(str(final_path))
-
         if "txt" in requested_formats:
             txt_path = ctx.job_dir / "transcript.txt"
             lines = []
@@ -85,6 +79,12 @@ class ExportStage(BaseStage):
             shutil.copy2(rttm_path, dest_rttm)
             artifacts.append(str(dest_rttm))
 
+        # final.json is ALWAYS written (mandatory machine contract), written LAST
+        final_path = ctx.job_dir / "final.json"
+        final_data = self._build_final_json(ctx, source, segments)
+        final_path.write_text(json.dumps(final_data, indent=2, ensure_ascii=False))
+        artifacts.append(str(final_path))
+
         log.info("export_complete", num_formats=len(requested_formats), formats=requested_formats)
         return StageResult(
             status=StageStatus.SUCCESS,
@@ -131,22 +131,43 @@ class ExportStage(BaseStage):
             "audio": audio_info,
             "speakers": list(speakers.values()),
             "segments": segments,
-            "artifacts": {
-                "srt": "transcript.srt",
-                "vtt": "transcript.vtt",
-                "txt": "transcript.txt",
-            },
+            "artifacts": self._discover_artifacts(ctx),
             "pipeline": {
                 "version": "0.1.0",
             },
+        }
+
+    def _discover_artifacts(self, ctx: StageContext) -> dict[str, str]:
+        """Build artifacts map dynamically from files actually on disk."""
+        artifact_files = {
+            "srt": "transcript.srt",
+            "vtt": "transcript.vtt",
+            "txt": "transcript.txt",
+            "rttm": "diarization.rttm",
+        }
+        return {
+            key: fname
+            for key, fname in artifact_files.items()
+            if (ctx.job_dir / fname).exists()
         }
 
     def validate(self, ctx: StageContext, result: StageResult) -> ValidationResult:
         checks: list[CheckResult] = []
         all_ok = True
 
+        # final.json is mandatory (always written)
+        final_path = ctx.job_dir / "final.json"
+        final_exists = final_path.exists()
+        checks.append(CheckResult(
+            name="final_json",
+            passed=final_exists,
+            details=f"{final_path} exists={final_exists}",
+        ))
+        if not final_exists:
+            all_ok = False
+
+        # Check requested export formats
         format_map = {
-            "json": "final.json",
             "txt": "transcript.txt",
             "srt": "transcript.srt",
             "vtt": "transcript.vtt",

@@ -11,7 +11,9 @@ from typing import Any
 
 from pipeline_transcriber.models.config import PipelineConfig, load_config
 from pipeline_transcriber.models.job import Job, load_jobs
-from pipeline_transcriber.models.stage import StageStatus, StageValidationError
+from pipeline_transcriber.models.stage import (
+    StageStatus, StageValidationError, StageEntry, compute_job_status,
+)
 from pipeline_transcriber.models.alert import AlertSeverity
 from pipeline_transcriber.stages import build_stage_sequence
 from pipeline_transcriber.stages.base import BaseStage, StageContext
@@ -33,6 +35,14 @@ class Orchestrator:
     def run_batch(self, jobs: list[Job], resume: bool = False) -> dict[str, Any]:
         setup_logging(self.config.logging, self.batch_id)
         log = logger.bind(batch_id=self.batch_id)
+
+        # Validate no duplicate job_ids
+        seen_ids: set[str] = set()
+        for job in jobs:
+            if job.job_id in seen_ids:
+                raise ValueError(f"Duplicate job_id in batch: {job.job_id!r}")
+            seen_ids.add(job.job_id)
+
         log.info("batch_started", total_jobs=len(jobs))
 
         for job in jobs:
@@ -75,28 +85,44 @@ class Orchestrator:
         )
 
         stages = build_stage_sequence(job_config, job)
-        job_status = "success"
-        has_partial = False
 
-        for stage in stages:
-            if resume and stage.stage_name.value in state.completed_stages:
-                log.info("stage_skipped_resume", stage=stage.stage_name.value)
-                continue
-
-            stage_result = self._run_stage(stage, ctx, state, log)
-            if stage_result == "failed":
-                if self._is_optional_stage(stage, job):
-                    has_partial = True
-                    log.warning("optional_stage_failed", stage=stage.stage_name.value)
+        try:
+            for stage in stages:
+                if resume and stage.stage_name.value in state.completed_stages:
+                    log.info("stage_skipped_resume", stage=stage.stage_name.value)
+                    ctx.stage_ledger.append(StageEntry(
+                        stage_name=stage.stage_name.value,
+                        status="skipped",
+                        skip_reason="resumed",
+                    ))
                     continue
-                job_status = "failed"
-                break
 
-        if job_status == "success" and has_partial:
-            job_status = "partial"
+                stage_result = self._run_stage(stage, ctx, state, log)
+                if stage_result == "failed":
+                    if self._is_optional_stage(stage, job):
+                        log.warning("optional_stage_failed", stage=stage.stage_name.value)
+                        continue
+                    break
+        finally:
+            # Guaranteed finalization: always compute status, save ledger, write report
+            job_status = compute_job_status(
+                ctx.stage_ledger,
+                lambda name: self._is_optional_stage_by_name(name, job),
+            )
 
-        state.mark_job_finished(job_status)
-        log.info("job_finished", status=job_status)
+            state.set_ledger([e.model_dump() for e in ctx.stage_ledger])
+            state.mark_job_finished(job_status)
+
+            # Run FinalizeReportStage outside the pipeline sequence
+            try:
+                from pipeline_transcriber.stages.finalize import FinalizeReportStage
+                finalizer = FinalizeReportStage()
+                finalizer.run(ctx, job_status=job_status)
+            except Exception as finalize_exc:
+                log.error("finalize_failed", error=str(finalize_exc))
+
+            log.info("job_finished", status=job_status)
+
         return job_status
 
     def _run_stage(self, stage: BaseStage, ctx: StageContext,
@@ -121,6 +147,27 @@ class Orchestrator:
             ctx.stage_outputs[stage_name] = result
             state.mark_stage_completed(stage_name, attempts)
 
+            # Build validation summary for ledger
+            validation_summary = None
+            if result.validation is not None:
+                validation_summary = {
+                    "ok": result.validation.ok,
+                    "checks": [
+                        {"name": c.name, "passed": c.passed, "details": c.details}
+                        for c in result.validation.checks
+                    ],
+                }
+
+            ctx.stage_ledger.append(StageEntry(
+                stage_name=stage_name,
+                status="success",
+                attempts=attempts,
+                duration_ms=duration_ms,
+                validation_summary=validation_summary,
+                warnings=result.warnings,
+                artifacts=result.artifacts,
+            ))
+
             self._write_stage_feedback(ctx, stage_name, result, attempts, True)
             log.info("stage_succeeded", stage=stage_name,
                      duration_ms=duration_ms, attempts=attempts)
@@ -128,15 +175,29 @@ class Orchestrator:
 
         except Exception as exc:
             duration_ms = int((time.monotonic() - t0) * 1000)
+            attempts_used = getattr(exc, "attempts_used", self.config.retry.max_attempts)
+            error_msg = str(exc)
+
+            state.mark_stage_failed(stage_name, attempts_used, error_msg)
+
+            ctx.stage_ledger.append(StageEntry(
+                stage_name=stage_name,
+                status="failed",
+                attempts=attempts_used,
+                duration_ms=duration_ms,
+                error=error_msg,
+            ))
+
             log.error("stage_failed", stage=stage_name,
-                      duration_ms=duration_ms, error=str(exc),
-                      exception_type=type(exc).__name__)
+                      duration_ms=duration_ms, error=error_msg,
+                      exception_type=type(exc).__name__,
+                      attempts_used=attempts_used)
             self.alert_manager.send(
                 job_id=ctx.job.job_id, stage=stage_name,
                 severity=AlertSeverity.ERROR,
                 error_code=f"STAGE_FAILED_{stage_name.upper()}",
-                message=str(exc),
-                attempts_used=self.config.retry.max_attempts,
+                message=error_msg,
+                attempts_used=attempts_used,
                 trace_id=ctx.trace_id,
             )
             # Extract validation checks from StageValidationError if available
@@ -147,7 +208,7 @@ class Orchestrator:
                     for c in exc.validation.checks
                 ]
             self._write_stage_feedback(
-                ctx, stage_name, None, self.config.retry.max_attempts,
+                ctx, stage_name, None, attempts_used,
                 False, validation_checks,
             )
             return "failed"
@@ -198,6 +259,22 @@ class Orchestrator:
 
         return False
 
+    def _is_optional_stage_by_name(self, stage_name: str, job: Job) -> bool:
+        """String-based adapter for _is_optional_stage, used by compute_job_status."""
+        from pipeline_transcriber.models.stage import StageName
+        try:
+            name = StageName(stage_name)
+        except ValueError:
+            return False
+
+        if name == StageName.VAD_SEGMENTATION:
+            return True
+        if name == StageName.ALIGNMENT:
+            return not job.enable_word_timestamps
+        if name in (StageName.SPEAKER_DIARIZATION, StageName.SPEAKER_ASSIGNMENT):
+            return not job.enable_diarization
+        return False
+
     def _build_batch_report(self, jobs: list[Job]) -> dict[str, Any]:
         success = sum(1 for s in self.results.values() if s == "success")
         failed = sum(1 for s in self.results.values() if s == "failed")
@@ -213,6 +290,11 @@ class Orchestrator:
         }
 
     def _save_batch_report(self, report: dict[str, Any]) -> None:
-        path = Path(self.config.app.work_dir) / "batch_report.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(report, indent=2))
+        work_dir = Path(self.config.app.work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        # Save per-batch report (unique, won't be overwritten by next batch)
+        per_batch_path = work_dir / f"batch_report_{self.batch_id}.json"
+        per_batch_path.write_text(json.dumps(report, indent=2))
+        # Also save as latest for convenience
+        latest_path = work_dir / "batch_report.json"
+        latest_path.write_text(json.dumps(report, indent=2))

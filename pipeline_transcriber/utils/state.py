@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 STATE_FILENAME = "state.json"
@@ -20,6 +21,8 @@ class JobState:
         self.current_stage: str | None = None
         self.status: str = "pending"
         self.stage_attempts: dict[str, int] = {}
+        self.failed_stages: dict[str, dict[str, Any]] = {}
+        self.stage_ledger: list[dict[str, Any]] = []
         self.updated_at: str | None = None
 
     # ------------------------------------------------------------------
@@ -39,10 +42,24 @@ class JobState:
         self.current_stage = None
         self._save()
 
+    def mark_stage_failed(self, stage_name: str, attempts: int, error: str) -> None:
+        """Record that a stage failed."""
+        self.failed_stages[stage_name] = {
+            "attempts": attempts,
+            "error": error,
+        }
+        self.current_stage = None
+        self._save()
+
     def mark_job_finished(self, status: str) -> None:
         """Mark the entire job as finished with a terminal status."""
         self.status = status
         self.current_stage = None
+        self._save()
+
+    def set_ledger(self, ledger_data: list[dict[str, Any]]) -> None:
+        """Store the full stage execution ledger."""
+        self.stage_ledger = ledger_data
         self._save()
 
     # ------------------------------------------------------------------
@@ -59,6 +76,8 @@ class JobState:
             "current_stage": self.current_stage,
             "status": self.status,
             "stage_attempts": self.stage_attempts,
+            "failed_stages": self.failed_stages,
+            "stage_ledger": self.stage_ledger,
             "updated_at": self.updated_at,
         }
         self.state_path.write_text(json.dumps(payload, indent=2) + "\n")
@@ -74,5 +93,7 @@ class JobState:
             state.current_stage = data.get("current_stage")
             state.status = data.get("status", "pending")
             state.stage_attempts = data.get("stage_attempts", {})
+            state.failed_stages = data.get("failed_stages", {})
+            state.stage_ledger = data.get("stage_ledger", [])
             state.updated_at = data.get("updated_at")
         return state

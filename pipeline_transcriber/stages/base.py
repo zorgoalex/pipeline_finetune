@@ -7,7 +7,7 @@ import structlog
 
 from pipeline_transcriber.models.config import PipelineConfig
 from pipeline_transcriber.models.job import Job
-from pipeline_transcriber.models.stage import StageName, StageResult, ValidationResult
+from pipeline_transcriber.models.stage import StageName, StageEntry, StageResult, ValidationResult
 
 
 @dataclass
@@ -19,6 +19,7 @@ class StageContext:
     batch_id: str
     trace_id: str
     stage_outputs: dict[str, StageResult] = field(default_factory=dict)
+    stage_ledger: list[StageEntry] = field(default_factory=list)
     # Typed inter-stage data
     download_output_path: Path | None = None
     audio_path: Path | None = None
