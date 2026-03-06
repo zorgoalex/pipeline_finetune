@@ -105,7 +105,7 @@ class DownloadStage(BaseStage):
                     all_ok = False
             if not exists:
                 all_ok = False
-        return ValidationResult(ok=all_ok, checks=checks, next_stage_allowed=all_ok)
+        return ValidationResult(ok=all_ok, checks=checks)
 
     def can_retry(self, error: Exception | None, ctx: StageContext) -> bool:
         if error is None:

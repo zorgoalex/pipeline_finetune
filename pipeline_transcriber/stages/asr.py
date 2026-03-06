@@ -143,7 +143,7 @@ class AsrStage(BaseStage):
         if not has_segments:
             all_ok = False
 
-        return ValidationResult(ok=all_ok, checks=checks, next_stage_allowed=all_ok)
+        return ValidationResult(ok=all_ok, checks=checks)
 
     def suggest_fallback(self, attempt: int, ctx: StageContext) -> dict[str, Any]:
         """On retry, try smaller model or lower batch size."""

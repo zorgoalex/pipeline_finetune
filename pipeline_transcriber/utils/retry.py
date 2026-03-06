@@ -7,15 +7,16 @@ from typing import Any, Callable
 import structlog
 
 from pipeline_transcriber.models.config import RetryConfig
+from pipeline_transcriber.models.stage import StageValidationError, ValidationResult
 
 logger = structlog.get_logger(__name__)
 
 
 def run_with_retry(
     func: Callable[[], Any],
-    validate_func: Callable[[Any], None],
+    validate_func: Callable[[Any], ValidationResult | None],
     can_retry_func: Callable[[Exception], bool],
-    suggest_fallback_func: Callable[[int], None],
+    suggest_fallback_func: Callable[[int], dict[str, Any]],
     retry_config: RetryConfig,
     *,
     stage_name: str,
@@ -32,7 +33,14 @@ def run_with_retry(
     for attempt in range(1, retry_config.max_attempts + 1):
         try:
             result = func()
-            validate_func(result)
+
+            # Run validation and attach result
+            validation = validate_func(result)
+            if validation is not None:
+                result.validation = validation
+                if not validation.ok:
+                    raise StageValidationError(validation)
+
             return result, attempt
         except Exception as exc:
             last_exception = exc
@@ -45,6 +53,15 @@ def run_with_retry(
                 error=str(exc),
             )
 
+            # Validation failures with retry_recommended=False skip retry
+            if (
+                isinstance(exc, StageValidationError)
+                and exc.validation
+                and not exc.validation.retry_recommended
+            ):
+                log.error("validation_failed_no_retry")
+                raise
+
             if not can_retry_func(exc):
                 log.error("non_retryable_error")
                 raise
@@ -54,7 +71,9 @@ def run_with_retry(
                 sleep_secs = retry_config.backoff_schedule[backoff_index]
                 log.warning("retry_scheduled", backoff_secs=sleep_secs)
                 time.sleep(sleep_secs)
-                suggest_fallback_func(attempt)
+                fallback_info = suggest_fallback_func(attempt)
+                if fallback_info:
+                    log.info("fallback_applied", **fallback_info)
             else:
                 log.error("all_attempts_exhausted")
 

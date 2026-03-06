@@ -1,0 +1,449 @@
+"""Tests for critical fixes P1-P5 from review."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from pipeline_transcriber.models.config import PipelineConfig, RetryConfig
+from pipeline_transcriber.models.job import Job
+from pipeline_transcriber.models.stage import (
+    CheckResult,
+    StageName,
+    StageResult,
+    StageStatus,
+    StageValidationError,
+    ValidationResult,
+)
+from pipeline_transcriber.orchestrator import Orchestrator
+from pipeline_transcriber.stages import build_stage_sequence
+from pipeline_transcriber.stages.base import BaseStage, StageContext
+from pipeline_transcriber.stages.finalize import FinalizeReportStage
+from pipeline_transcriber.utils.retry import run_with_retry
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def make_config(tmp_path: Path) -> PipelineConfig:
+    cfg = PipelineConfig()
+    cfg.app.work_dir = tmp_path / "output"
+    cfg.logging.log_dir = tmp_path / "logs"
+    cfg.alerts.alerts_file = tmp_path / "alerts.jsonl"
+    cfg.retry.max_attempts = 1
+    cfg.retry.backoff_schedule = [0]
+    cfg.vad.enabled = False
+    cfg.alignment.enabled = False
+    cfg.diarization.enabled = False
+    return cfg
+
+
+def make_job(job_id: str = "test-job-01", **kwargs) -> Job:
+    defaults = dict(
+        job_id=job_id,
+        source_type="local_file",
+        source="/tmp/test.wav",
+        output_formats=["json", "txt"],
+    )
+    defaults.update(kwargs)
+    return Job(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# P1: Validation-driven retry
+# ---------------------------------------------------------------------------
+
+class TestValidationDrivenRetry:
+    """P1: StageValidationError + retry_recommended drives retry logic."""
+
+    def test_validation_error_has_failed_checks(self):
+        validation = ValidationResult(
+            ok=False,
+            checks=[
+                CheckResult(name="check_a", passed=True),
+                CheckResult(name="check_b", passed=False, details="bad"),
+            ],
+        )
+        err = StageValidationError(validation)
+        assert "check_b" in str(err)
+        assert err.validation is validation
+
+    def test_retry_skipped_when_retry_recommended_false(self):
+        """When validation fails with retry_recommended=False, retry is skipped."""
+        call_count = 0
+
+        def failing_func():
+            nonlocal call_count
+            call_count += 1
+            return StageResult(status=StageStatus.SUCCESS, artifacts=[])
+
+        def validate_func(result):
+            return ValidationResult(
+                ok=False,
+                checks=[CheckResult(name="bad", passed=False)],
+                retry_recommended=False,
+            )
+
+        retry_cfg = RetryConfig(max_attempts=5, backoff_schedule=[0, 0, 0, 0, 0])
+        with pytest.raises(StageValidationError):
+            run_with_retry(
+                func=failing_func,
+                validate_func=validate_func,
+                can_retry_func=lambda e: True,
+                suggest_fallback_func=lambda a: {},
+                retry_config=retry_cfg,
+                stage_name="test",
+                job_id="j1",
+                trace_id="t1",
+            )
+        assert call_count == 1  # No retry happened
+
+    def test_retry_happens_when_retry_recommended_true(self):
+        """When validation fails with retry_recommended=True and can_retry=True, retries occur."""
+        call_count = 0
+
+        def func():
+            nonlocal call_count
+            call_count += 1
+            return StageResult(status=StageStatus.SUCCESS, artifacts=[])
+
+        def validate_func(result):
+            if call_count < 3:
+                return ValidationResult(
+                    ok=False,
+                    checks=[CheckResult(name="bad", passed=False)],
+                    retry_recommended=True,
+                )
+            return ValidationResult(ok=True, checks=[])
+
+        retry_cfg = RetryConfig(max_attempts=5, backoff_schedule=[0, 0, 0, 0, 0])
+        result, attempts = run_with_retry(
+            func=func,
+            validate_func=validate_func,
+            can_retry_func=lambda e: True,
+            suggest_fallback_func=lambda a: {},
+            retry_config=retry_cfg,
+            stage_name="test",
+            job_id="j1",
+            trace_id="t1",
+        )
+        assert attempts == 3
+        assert call_count == 3
+
+    def test_validation_result_attached_to_stage_result(self):
+        """Successful validation is attached to result."""
+        def func():
+            return StageResult(status=StageStatus.SUCCESS, artifacts=[])
+
+        validation = ValidationResult(ok=True, checks=[
+            CheckResult(name="ok_check", passed=True),
+        ])
+
+        result, _ = run_with_retry(
+            func=func,
+            validate_func=lambda r: validation,
+            can_retry_func=lambda e: False,
+            suggest_fallback_func=lambda a: {},
+            retry_config=RetryConfig(max_attempts=1, backoff_schedule=[0]),
+            stage_name="test",
+            job_id="j1",
+            trace_id="t1",
+        )
+        assert result.validation is validation
+
+
+# ---------------------------------------------------------------------------
+# P2: QA gatekeeper - tested in test_phase3.py already, adding edge case
+# ---------------------------------------------------------------------------
+
+class TestQaGatekeeper:
+    """P2: QA validate() distinguishes hard vs soft failures."""
+
+    def test_soft_failure_passes_validation(self):
+        """Non-critical check failure (word_alignment without flag) passes."""
+        from pipeline_transcriber.stages.qa import QaStage, QA_METRICS_ALL_PASSED, QA_METRICS_CHECKS
+
+        stage = QaStage()
+        job = make_job()
+        cfg = make_config(Path("/tmp"))
+        cfg.qa.fail_on_missing_word_timestamps = False
+
+        ctx = StageContext(
+            job=job, config=cfg, job_dir=Path("/tmp/qa_test"),
+            batch_id="b1", trace_id="t1",
+        )
+
+        result = StageResult(
+            status=StageStatus.SUCCESS,
+            metrics={
+                QA_METRICS_ALL_PASSED: False,
+                QA_METRICS_CHECKS: [
+                    {"name": "final_json_exists", "passed": True},
+                    {"name": "segments_non_empty", "passed": True},
+                    {"name": "time_intervals_valid", "passed": True},
+                    {"name": "no_negative_durations", "passed": True},
+                    {"name": "word_alignment_ratio", "passed": False, "details": "low ratio"},
+                ],
+            },
+        )
+
+        validation = stage.validate(ctx, result)
+        assert validation.ok is True  # soft failure, passes
+
+    def test_hard_failure_fails_validation(self):
+        """Hard failure (segments_non_empty) causes validation fail."""
+        from pipeline_transcriber.stages.qa import QaStage, QA_METRICS_ALL_PASSED, QA_METRICS_CHECKS
+
+        stage = QaStage()
+        job = make_job()
+        cfg = make_config(Path("/tmp"))
+
+        ctx = StageContext(
+            job=job, config=cfg, job_dir=Path("/tmp/qa_test"),
+            batch_id="b1", trace_id="t1",
+        )
+
+        result = StageResult(
+            status=StageStatus.SUCCESS,
+            metrics={
+                QA_METRICS_ALL_PASSED: False,
+                QA_METRICS_CHECKS: [
+                    {"name": "final_json_exists", "passed": True},
+                    {"name": "segments_non_empty", "passed": False, "details": "0 segments"},
+                    {"name": "time_intervals_valid", "passed": True},
+                    {"name": "no_negative_durations", "passed": True},
+                ],
+            },
+        )
+
+        validation = stage.validate(ctx, result)
+        assert validation.ok is False
+        assert validation.retry_recommended is False
+
+
+# ---------------------------------------------------------------------------
+# P3: Finalize incorporates QA + patches final.json
+# ---------------------------------------------------------------------------
+
+class TestFinalizePatching:
+    """P3/P5.3: Finalize patches final.json with honest status."""
+
+    def test_finalize_patches_final_json_success(self, tmp_path: Path):
+        """When all stages succeed, final.json status = 'success'."""
+        job = make_job()
+        cfg = make_config(tmp_path)
+        job_dir = tmp_path / "job"
+        job_dir.mkdir()
+
+        # Create final.json as export would
+        final_data = {"job_id": job.job_id, "status": "success", "segments": []}
+        (job_dir / "final.json").write_text(json.dumps(final_data))
+
+        ctx = StageContext(
+            job=job, config=cfg, job_dir=job_dir,
+            batch_id="b1", trace_id="t1",
+        )
+        # Add a successful stage output
+        ctx.stage_outputs["INPUT_VALIDATE"] = StageResult(
+            status=StageStatus.SUCCESS, artifacts=[]
+        )
+
+        stage = FinalizeReportStage()
+        result = stage.run(ctx)
+        assert result.status == StageStatus.SUCCESS
+
+        patched = json.loads((job_dir / "final.json").read_text())
+        assert patched["status"] == "success"
+
+    def test_finalize_patches_final_json_partial(self, tmp_path: Path):
+        """When some stages failed, final.json status = 'partial'."""
+        job = make_job()
+        cfg = make_config(tmp_path)
+        job_dir = tmp_path / "job"
+        job_dir.mkdir()
+
+        final_data = {"job_id": job.job_id, "status": "success", "segments": []}
+        (job_dir / "final.json").write_text(json.dumps(final_data))
+
+        ctx = StageContext(
+            job=job, config=cfg, job_dir=job_dir,
+            batch_id="b1", trace_id="t1",
+        )
+        ctx.stage_outputs["INPUT_VALIDATE"] = StageResult(
+            status=StageStatus.SUCCESS, artifacts=[]
+        )
+        ctx.stage_outputs["VAD_SEGMENTATION"] = StageResult(
+            status=StageStatus.FAILED, artifacts=[]
+        )
+
+        stage = FinalizeReportStage()
+        result = stage.run(ctx)
+
+        patched = json.loads((job_dir / "final.json").read_text())
+        assert patched["status"] == "partial"
+
+    def test_finalize_incorporates_qa_report(self, tmp_path: Path):
+        """Finalize includes qa_report.json in report.json."""
+        job = make_job()
+        cfg = make_config(tmp_path)
+        job_dir = tmp_path / "job"
+        job_dir.mkdir()
+
+        qa_data = {"all_passed": True, "checks": []}
+        (job_dir / "qa_report.json").write_text(json.dumps(qa_data))
+
+        ctx = StageContext(
+            job=job, config=cfg, job_dir=job_dir,
+            batch_id="b1", trace_id="t1",
+        )
+        ctx.stage_outputs["ASR"] = StageResult(
+            status=StageStatus.SUCCESS, artifacts=[]
+        )
+
+        stage = FinalizeReportStage()
+        stage.run(ctx)
+
+        report = json.loads((job_dir / "report.json").read_text())
+        assert "qa" in report
+        assert report["qa"]["all_passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# P4: Config isolation between batch jobs
+# ---------------------------------------------------------------------------
+
+class TestConfigIsolation:
+    """P4: model_copy(deep=True) prevents config mutation leak."""
+
+    def test_fallback_mutation_does_not_leak_between_jobs(self, tmp_path: Path):
+        """Config changes in one job don't affect subsequent jobs or global config."""
+
+        configs_at_start: list[str] = []
+
+        class RecordAndMutateStage(BaseStage):
+            @property
+            def stage_name(self):
+                return StageName.ASR_TRANSCRIPTION
+
+            def run(self, ctx: StageContext) -> StageResult:
+                # Record model name BEFORE mutation
+                configs_at_start.append(ctx.config.asr.model_name)
+                # Mutate config like a fallback would
+                ctx.config.asr.model_name = "mutated-model"
+                return StageResult(status=StageStatus.SUCCESS, artifacts=[])
+
+            def validate(self, ctx, result):
+                return ValidationResult(ok=True, checks=[])
+
+        def build_stages(config, job=None):
+            return [RecordAndMutateStage(), FinalizeReportStage()]
+
+        cfg = make_config(tmp_path)
+        original_model = cfg.asr.model_name
+
+        with patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=build_stages):
+            orch = Orchestrator(cfg)
+            orch.run_batch([make_job("job-a"), make_job("job-b")])
+
+        # Both jobs should start with original model (isolation works)
+        assert configs_at_start[0] == original_model
+        assert configs_at_start[1] == original_model
+        # Global config unchanged
+        assert cfg.asr.model_name == original_model
+
+
+# ---------------------------------------------------------------------------
+# P5: Per-job stage selection and _is_optional_stage
+# ---------------------------------------------------------------------------
+
+class TestPerJobStages:
+    """P5: build_stage_sequence respects job flags; _is_optional_stage respects them too."""
+
+    def test_alignment_included_when_job_requests_word_timestamps(self):
+        cfg = PipelineConfig()
+        cfg.alignment.enabled = True
+        job = make_job(enable_word_timestamps=True)
+        stages = build_stage_sequence(cfg, job)
+        stage_names = [s.stage_name for s in stages]
+        assert StageName.ALIGNMENT in stage_names
+
+    def test_alignment_excluded_when_job_disables_word_timestamps(self):
+        cfg = PipelineConfig()
+        cfg.alignment.enabled = True
+        job = make_job(enable_word_timestamps=False)
+        stages = build_stage_sequence(cfg, job)
+        stage_names = [s.stage_name for s in stages]
+        assert StageName.ALIGNMENT not in stage_names
+
+    def test_diarization_included_when_job_requests_it(self):
+        cfg = PipelineConfig()
+        cfg.diarization.enabled = True
+        job = make_job(enable_diarization=True)
+        stages = build_stage_sequence(cfg, job)
+        stage_names = [s.stage_name for s in stages]
+        assert StageName.SPEAKER_DIARIZATION in stage_names
+        assert StageName.SPEAKER_ASSIGNMENT in stage_names
+
+    def test_diarization_excluded_when_job_disables_it(self):
+        cfg = PipelineConfig()
+        cfg.diarization.enabled = True
+        job = make_job(enable_diarization=False)
+        stages = build_stage_sequence(cfg, job)
+        stage_names = [s.stage_name for s in stages]
+        assert StageName.SPEAKER_DIARIZATION not in stage_names
+
+    def test_backward_compat_no_job(self):
+        """build_stage_sequence works without job param (backward compat)."""
+        cfg = PipelineConfig()
+        cfg.alignment.enabled = True
+        cfg.diarization.enabled = True
+        stages = build_stage_sequence(cfg)
+        stage_names = [s.stage_name for s in stages]
+        assert StageName.ALIGNMENT in stage_names
+        assert StageName.SPEAKER_DIARIZATION in stage_names
+
+
+class TestIsOptionalStage:
+    """P5.4: _is_optional_stage respects job-level flags."""
+
+    def _get_orchestrator(self, tmp_path: Path) -> Orchestrator:
+        return Orchestrator(make_config(tmp_path))
+
+    def test_vad_always_optional(self, tmp_path: Path):
+        from pipeline_transcriber.stages.vad import VadStage
+        orch = self._get_orchestrator(tmp_path)
+        job = make_job(enable_diarization=True, enable_word_timestamps=True)
+        assert orch._is_optional_stage(VadStage(), job) is True
+
+    def test_alignment_not_optional_when_word_timestamps_requested(self, tmp_path: Path):
+        from pipeline_transcriber.stages.align import AlignStage
+        orch = self._get_orchestrator(tmp_path)
+        job = make_job(enable_word_timestamps=True)
+        assert orch._is_optional_stage(AlignStage(), job) is False
+
+    def test_alignment_optional_when_word_timestamps_not_requested(self, tmp_path: Path):
+        from pipeline_transcriber.stages.align import AlignStage
+        orch = self._get_orchestrator(tmp_path)
+        job = make_job(enable_word_timestamps=False)
+        assert orch._is_optional_stage(AlignStage(), job) is True
+
+    def test_diarization_not_optional_when_requested(self, tmp_path: Path):
+        from pipeline_transcriber.stages.diarize import DiarizeStage
+        orch = self._get_orchestrator(tmp_path)
+        job = make_job(enable_diarization=True)
+        assert orch._is_optional_stage(DiarizeStage(), job) is False
+
+    def test_diarization_optional_when_not_requested(self, tmp_path: Path):
+        from pipeline_transcriber.stages.diarize import DiarizeStage
+        orch = self._get_orchestrator(tmp_path)
+        job = make_job(enable_diarization=False)
+        assert orch._is_optional_stage(DiarizeStage(), job) is True
+
+    def test_core_stage_never_optional(self, tmp_path: Path):
+        from pipeline_transcriber.stages.asr import AsrStage
+        orch = self._get_orchestrator(tmp_path)
+        job = make_job()
+        assert orch._is_optional_stage(AsrStage(), job) is False

@@ -66,7 +66,7 @@ def _ok_result():
 
 
 def _ok_validation():
-    return ValidationResult(ok=True, checks=[], next_stage_allowed=True)
+    return ValidationResult(ok=True, checks=[])
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +242,7 @@ class MockAssignSpeakersStage(BaseStage):
 # Stage sequence builders
 # ---------------------------------------------------------------------------
 
-def _build_7_stages(config):
+def _build_7_stages(config, job=None):
     """Minimal pipeline: no vad, alignment, diarization."""
     return [
         MockInputValidateStage(),
@@ -255,7 +255,7 @@ def _build_7_stages(config):
     ]
 
 
-def _build_all_11_stages(config):
+def _build_all_11_stages(config, job=None):
     """Full pipeline with all optional stages."""
     return [
         MockInputValidateStage(),
@@ -302,7 +302,7 @@ class TestRetryIntegration:
             def can_retry(self, error, ctx):
                 return True
 
-        def build_retry_stages(config):
+        def build_retry_stages(config, job=None):
             return [
                 MockInputValidateStage(),
                 MockDownloadStage(),
@@ -347,7 +347,7 @@ class TestRetryIntegration:
             def can_retry(self, error, ctx):
                 return True
 
-        def build_fail_stages(config):
+        def build_fail_stages(config, job=None):
             return [
                 MockInputValidateStage(),
                 MockDownloadStage(),
@@ -396,7 +396,7 @@ class TestRetryIntegration:
             def can_retry(self, error, ctx):
                 return False
 
-        def build_nonretry_stages(config):
+        def build_nonretry_stages(config, job=None):
             return [
                 MockInputValidateStage(),
                 MockDownloadStage(),
@@ -481,7 +481,7 @@ class TestFullPipelineMock:
             def can_retry(self, error, ctx):
                 return True
 
-        def build_partial_stages(config):
+        def build_partial_stages(config, job=None):
             return [
                 MockInputValidateStage(),
                 MockDownloadStage(),

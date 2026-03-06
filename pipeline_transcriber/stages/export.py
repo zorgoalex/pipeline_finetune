@@ -168,4 +168,4 @@ class ExportStage(BaseStage):
             if not exists:
                 all_ok = False
 
-        return ValidationResult(ok=all_ok, checks=checks, next_stage_allowed=all_ok)
+        return ValidationResult(ok=all_ok, checks=checks)

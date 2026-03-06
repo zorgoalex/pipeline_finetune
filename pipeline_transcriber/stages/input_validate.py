@@ -52,7 +52,6 @@ class InputValidateStage(BaseStage):
                     else "One or more required job fields are missing or invalid.",
                 )
             ],
-            next_stage_allowed=passed,
         )
 
     def can_retry(self, error: Exception | None, ctx: StageContext) -> bool:

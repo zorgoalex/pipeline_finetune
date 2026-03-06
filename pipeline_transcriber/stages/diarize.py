@@ -189,7 +189,7 @@ class DiarizeStage(BaseStage):
             if not speakers_ok:
                 pass  # informational only
 
-        return ValidationResult(ok=all_ok, checks=checks, next_stage_allowed=all_ok)
+        return ValidationResult(ok=all_ok, checks=checks)
 
     def can_retry(self, error: Exception | None, ctx: StageContext) -> bool:
         if isinstance(error, HfTokenError):

@@ -11,6 +11,10 @@ from pipeline_transcriber.models.stage import (
 )
 from pipeline_transcriber.stages.base import BaseStage, StageContext
 
+# Metric keys for QA results passed via StageResult.metrics
+QA_METRICS_ALL_PASSED = "qa_all_passed"
+QA_METRICS_CHECKS = "qa_checks"
+
 
 class QaStage(BaseStage):
     @property
@@ -72,7 +76,7 @@ class QaStage(BaseStage):
                 })
                 if not ratio_ok:
                     if qa_cfg.fail_on_missing_word_timestamps:
-                        pass  # will fail
+                        pass  # will be caught by validate()
                     else:
                         warnings.append(f"Word alignment ratio {ratio:.2f} below threshold {threshold:.2f}")
 
@@ -91,7 +95,7 @@ class QaStage(BaseStage):
                 })
                 if not ratio_ok:
                     if qa_cfg.fail_on_missing_diarization:
-                        pass  # will fail
+                        pass  # will be caught by validate()
                     else:
                         warnings.append(f"Speaker assignment ratio {ratio:.2f} below threshold {threshold:.2f}")
 
@@ -116,7 +120,7 @@ class QaStage(BaseStage):
             "warnings": warnings,
         }
 
-        report_path = ctx.job_dir / "report.json"
+        report_path = ctx.job_dir / "qa_report.json"
         report_path.write_text(json.dumps(report, indent=2))
 
         qa_summary = {
@@ -141,19 +145,63 @@ class QaStage(BaseStage):
             status=StageStatus.SUCCESS,
             artifacts=artifacts,
             warnings=warnings,
+            metrics={
+                QA_METRICS_ALL_PASSED: all_passed,
+                QA_METRICS_CHECKS: checks,
+            },
         )
 
     def validate(self, ctx: StageContext, result: StageResult) -> ValidationResult:
+        all_passed = result.metrics.get(QA_METRICS_ALL_PASSED, True)
+        qa_checks = result.metrics.get(QA_METRICS_CHECKS, [])
+        qa_cfg = ctx.config.qa
+
+        if all_passed:
+            return ValidationResult(
+                ok=True,
+                checks=[CheckResult(name="qa_passed", passed=True, details="All QA checks passed.")],
+            )
+
+        # Determine which failures are hard vs soft
+        failed_checks: list[CheckResult] = []
+        has_hard_failure = False
+
+        # Hard failures: unconditional
+        hard_fail_names = {"final_json_exists", "segments_non_empty",
+                           "time_intervals_valid", "no_negative_durations"}
+        # Flag-gated failures
+        flag_gated = {
+            "word_alignment_ratio": qa_cfg.fail_on_missing_word_timestamps,
+            "speaker_assignment_ratio": qa_cfg.fail_on_missing_diarization,
+        }
+
+        for check in qa_checks:
+            name = check["name"]
+            passed = check["passed"]
+            if not passed:
+                is_hard = name in hard_fail_names
+                is_gated_fail = flag_gated.get(name, False)
+                if is_hard or is_gated_fail:
+                    has_hard_failure = True
+                failed_checks.append(CheckResult(
+                    name=name,
+                    passed=False,
+                    details=check.get("details", ""),
+                ))
+
+        if has_hard_failure:
+            return ValidationResult(
+                ok=False,
+                checks=failed_checks,
+                retry_recommended=False,
+                retry_reason="QA checks failed",
+            )
+
+        # Soft failures only — pass with warnings
         return ValidationResult(
             ok=True,
-            checks=[
-                CheckResult(
-                    name="qa_completed",
-                    passed=True,
-                    details="QA stage completed successfully.",
-                )
-            ],
-            next_stage_allowed=True,
+            checks=[CheckResult(name="qa_passed_with_warnings", passed=True,
+                                details="QA passed; some non-critical checks below threshold.")],
         )
 
     def can_retry(self, error: Exception | None, ctx: StageContext) -> bool:

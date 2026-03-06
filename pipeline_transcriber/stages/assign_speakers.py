@@ -208,4 +208,4 @@ class AssignSpeakersStage(BaseStage):
                 if not ratio_ok:
                     all_ok = False
 
-        return ValidationResult(ok=all_ok, checks=checks, next_stage_allowed=all_ok)
+        return ValidationResult(ok=all_ok, checks=checks)

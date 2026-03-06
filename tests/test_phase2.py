@@ -378,7 +378,7 @@ class TestDownloadStageLocalFile:
         result = stage.run(ctx)
         validation = stage.validate(ctx, result)
         assert validation.ok is True
-        assert validation.next_stage_allowed is True
+        assert validation.ok is True  # next_stage_allowed removed
         assert len(validation.checks) > 0
 
 
@@ -556,7 +556,7 @@ class TestExportStageValidation:
         result = stage.run(ctx)
         validation = stage.validate(ctx, result)
         assert validation.ok is True
-        assert validation.next_stage_allowed is True
+        assert validation.ok is True  # next_stage_allowed removed
 
     def test_validate_missing_file(self, tmp_path: Path) -> None:
         ctx = _make_context(tmp_path)

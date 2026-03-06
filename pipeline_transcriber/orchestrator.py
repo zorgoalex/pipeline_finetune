@@ -11,7 +11,7 @@ from typing import Any
 
 from pipeline_transcriber.models.config import PipelineConfig, load_config
 from pipeline_transcriber.models.job import Job, load_jobs
-from pipeline_transcriber.models.stage import StageStatus
+from pipeline_transcriber.models.stage import StageStatus, StageValidationError
 from pipeline_transcriber.models.alert import AlertSeverity
 from pipeline_transcriber.stages import build_stage_sequence
 from pipeline_transcriber.stages.base import BaseStage, StageContext
@@ -68,12 +68,13 @@ class Orchestrator:
         log.info("job_started")
 
         state = JobState.load(job.job_id, job_dir) if resume else JobState(job.job_id, job_dir)
+        job_config = self.config.model_copy(deep=True)
         ctx = StageContext(
-            job=job, config=self.config, job_dir=job_dir,
+            job=job, config=job_config, job_dir=job_dir,
             batch_id=self.batch_id, trace_id=trace_id,
         )
 
-        stages = build_stage_sequence(self.config)
+        stages = build_stage_sequence(job_config, job)
         job_status = "success"
         has_partial = False
 
@@ -138,19 +139,41 @@ class Orchestrator:
                 attempts_used=self.config.retry.max_attempts,
                 trace_id=ctx.trace_id,
             )
-            self._write_stage_feedback(ctx, stage_name, None, self.config.retry.max_attempts, False)
+            # Extract validation checks from StageValidationError if available
+            validation_checks = None
+            if isinstance(exc, StageValidationError) and exc.validation:
+                validation_checks = [
+                    {"name": c.name, "passed": c.passed, "details": c.details}
+                    for c in exc.validation.checks
+                ]
+            self._write_stage_feedback(
+                ctx, stage_name, None, self.config.retry.max_attempts,
+                False, validation_checks,
+            )
             return "failed"
 
     def _write_stage_feedback(self, ctx: StageContext, stage_name: str,
-                              result: Any, attempts: int, success: bool) -> None:
+                              result: Any, attempts: int, success: bool,
+                              validation_checks: list[dict] | None = None) -> None:
         feedback_dir = ctx.job_dir / "stage_feedback"
         feedback_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build checks from result.validation or from exception
+        checks: list[dict] = []
+        if validation_checks is not None:
+            checks = validation_checks
+        elif result is not None and hasattr(result, "validation") and result.validation is not None:
+            checks = [
+                {"name": c.name, "passed": c.passed, "details": c.details}
+                for c in result.validation.checks
+            ]
+
         feedback = {
             "stage": stage_name,
             "attempt": attempts,
             "status": "pass" if success else "fail",
             "retry_needed": not success,
-            "checks": [],
+            "checks": checks,
         }
         if result and hasattr(result, "artifacts"):
             feedback["artifacts"] = result.artifacts
@@ -159,9 +182,21 @@ class Orchestrator:
 
     def _is_optional_stage(self, stage: BaseStage, job: Job) -> bool:
         from pipeline_transcriber.models.stage import StageName
-        optional = {StageName.VAD_SEGMENTATION, StageName.ALIGNMENT,
-                    StageName.SPEAKER_DIARIZATION, StageName.SPEAKER_ASSIGNMENT}
-        return stage.stage_name in optional
+        name = stage.stage_name
+
+        # VAD is always optional
+        if name == StageName.VAD_SEGMENTATION:
+            return True
+
+        # Alignment is optional only if word timestamps not requested
+        if name == StageName.ALIGNMENT:
+            return not job.enable_word_timestamps
+
+        # Diarization/speaker assignment optional only if diarization not requested
+        if name in (StageName.SPEAKER_DIARIZATION, StageName.SPEAKER_ASSIGNMENT):
+            return not job.enable_diarization
+
+        return False
 
     def _build_batch_report(self, jobs: list[Job]) -> dict[str, Any]:
         success = sum(1 for s in self.results.values() if s == "success")

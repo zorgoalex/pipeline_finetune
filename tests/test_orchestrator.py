@@ -44,7 +44,7 @@ def make_job(job_id: str = "test-job-01") -> Job:
     )
 
 
-def _mock_build_stage_sequence(config):
+def _mock_build_stage_sequence(config, job=None):
     """Build mock stage sequence that doesn't need real tools."""
     from pipeline_transcriber.models.stage import StageName
     from pipeline_transcriber.stages.input_validate import InputValidateStage
@@ -68,7 +68,7 @@ def _mock_build_stage_sequence(config):
             return StageResult(status=StageStatus.SUCCESS, artifacts=[str(media), str(meta)])
 
         def validate(self, ctx, result):
-            return ValidationResult(ok=True, checks=[], next_stage_allowed=True)
+            return ValidationResult(ok=True, checks=[])
 
     class MockAudioPrepareStage(BaseStage):
         @property
@@ -86,7 +86,7 @@ def _mock_build_stage_sequence(config):
             return StageResult(status=StageStatus.SUCCESS, artifacts=[str(audio), str(probe)])
 
         def validate(self, ctx, result):
-            return ValidationResult(ok=True, checks=[], next_stage_allowed=True)
+            return ValidationResult(ok=True, checks=[])
 
     class MockAsrStage(BaseStage):
         @property
@@ -108,7 +108,7 @@ def _mock_build_stage_sequence(config):
             return StageResult(status=StageStatus.SUCCESS, artifacts=[str(raw), str(jsonl), str(report)])
 
         def validate(self, ctx, result):
-            return ValidationResult(ok=True, checks=[], next_stage_allowed=True)
+            return ValidationResult(ok=True, checks=[])
 
     return [
         InputValidateStage(),

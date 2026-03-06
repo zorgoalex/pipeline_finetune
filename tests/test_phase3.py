@@ -170,7 +170,7 @@ class TestVadStage:
         )
         vr = stage.validate(ctx, result)
         assert vr.ok is True
-        assert vr.next_stage_allowed is True
+        assert vr.ok is True  # next_stage_allowed removed
 
     def test_validate_fail_with_empty_segments(self, tmp_path: Path):
         stage = self._stage()
@@ -518,7 +518,7 @@ class TestQaStage:
         assert result.status == StageStatus.SUCCESS
 
         # Verify report written
-        report_path = ctx.job_dir / "report.json"
+        report_path = ctx.job_dir / "qa_report.json"
         assert report_path.exists()
         report = json.loads(report_path.read_text())
         check_names = [c["name"] for c in report["checks"]]
@@ -542,7 +542,7 @@ class TestQaStage:
         result = stage.run(ctx)
         assert result.status == StageStatus.SUCCESS
 
-        report = json.loads((ctx.job_dir / "report.json").read_text())
+        report = json.loads((ctx.job_dir / "qa_report.json").read_text())
         check_names = [c["name"] for c in report["checks"]]
         assert "speaker_assignment_ratio" in check_names
 
@@ -558,18 +558,40 @@ class TestQaStage:
         final_path.write_text("{}")
 
         result = stage.run(ctx)
-        report = json.loads((ctx.job_dir / "report.json").read_text())
+        report = json.loads((ctx.job_dir / "qa_report.json").read_text())
         checks_by_name = {c["name"]: c for c in report["checks"]}
         assert checks_by_name["time_intervals_valid"]["passed"] is True
         assert checks_by_name["no_negative_durations"]["passed"] is True
 
-    def test_validate_always_ok(self, tmp_path: Path):
+    def test_validate_ok_when_all_passed(self, tmp_path: Path):
         stage = self._stage()
         ctx = make_context(tmp_path)
-        result = StageResult(status=StageStatus.SUCCESS, artifacts=[])
+        from pipeline_transcriber.stages.qa import QA_METRICS_ALL_PASSED, QA_METRICS_CHECKS
+        result = StageResult(
+            status=StageStatus.SUCCESS,
+            artifacts=[],
+            metrics={QA_METRICS_ALL_PASSED: True, QA_METRICS_CHECKS: []},
+        )
         vr = stage.validate(ctx, result)
         assert vr.ok is True
-        assert vr.next_stage_allowed is True
+
+    def test_validate_fails_on_hard_failure(self, tmp_path: Path):
+        stage = self._stage()
+        ctx = make_context(tmp_path)
+        from pipeline_transcriber.stages.qa import QA_METRICS_ALL_PASSED, QA_METRICS_CHECKS
+        result = StageResult(
+            status=StageStatus.SUCCESS,
+            artifacts=[],
+            metrics={
+                QA_METRICS_ALL_PASSED: False,
+                QA_METRICS_CHECKS: [
+                    {"name": "segments_non_empty", "passed": False, "details": "0 segments"},
+                ],
+            },
+        )
+        vr = stage.validate(ctx, result)
+        assert vr.ok is False
+        assert vr.retry_recommended is False
 
     def test_can_retry_returns_false(self, tmp_path: Path):
         stage = self._stage()
