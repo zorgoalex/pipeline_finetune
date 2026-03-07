@@ -54,6 +54,5 @@ def build_stage_sequence(config: PipelineConfig, job: Job | None = None) -> list
 
     stages.append(ExportStage())
     stages.append(QaStage())
-    # FinalizeReportStage is NOT in the sequence — it runs unconditionally
-    # via try/finally in the orchestrator to guarantee report creation.
+    stages.append(FinalizeReportStage())
     return stages

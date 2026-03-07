@@ -14,7 +14,7 @@ import pytest
 from pipeline_transcriber.models.config import PipelineConfig
 from pipeline_transcriber.models.execution import ExecutionOutcome, ExecutionPlan
 from pipeline_transcriber.models.job import ExpectedSpeakers, Job
-from pipeline_transcriber.models.stage import StageEntry, StageResult, StageStatus
+from pipeline_transcriber.models.stage import StageEntry, StageName, StageResult, StageStatus
 from pipeline_transcriber.orchestrator import Orchestrator
 from pipeline_transcriber.stages.base import StageContext
 from pipeline_transcriber.stages.finalize import FinalizeReportStage
@@ -403,6 +403,81 @@ class TestIndestructibleFinalization:
 
         loaded = JobState.load("fin_fail", job_dir)
         assert loaded.finalization_status == "failed"
+
+    def test_orchestrator_injects_finalizer_for_legacy_sequence(self, tmp_path: Path):
+        """Legacy mocked sequences without finalizer still get guaranteed finalization."""
+        cfg = make_config(tmp_path)
+        job = make_job()
+
+        class OkStage:
+            stage_name = StageName.INPUT_VALIDATE
+
+            def run(self, ctx):
+                return StageResult(status=StageStatus.SUCCESS)
+
+            def validate(self, ctx, result):
+                from pipeline_transcriber.models.stage import ValidationResult
+                return ValidationResult(ok=True, checks=[])
+
+            def can_retry(self, error, ctx):
+                return True
+
+            def suggest_fallback(self, attempt, ctx):
+                return {}
+
+        def _legacy_build(config, job=None):
+            return [OkStage()]
+
+        with patch("pipeline_transcriber.orchestrator.build_stage_sequence", _legacy_build):
+            orch = Orchestrator(cfg)
+            report = orch.run_batch([job])
+
+        assert report["success"] == 1
+        state_path = Path(cfg.app.work_dir) / job.job_id / "state.json"
+        state = json.loads(state_path.read_text())
+        assert "FINALIZE_REPORT" in state["execution_plan"]
+        assert "FINALIZE_REPORT" in state["completed_stages"]
+        assert any(e["stage_name"] == "FINALIZE_REPORT" for e in state["stage_ledger"])
+
+    def test_finalizer_failure_visible_without_overriding_main_status(self, tmp_path: Path):
+        """Main job status stays honest while finalizer failure is explicit in state/ledger."""
+        cfg = make_config(tmp_path)
+        job = make_job()
+
+        class OkStage:
+            stage_name = StageName.INPUT_VALIDATE
+
+            def run(self, ctx):
+                return StageResult(status=StageStatus.SUCCESS)
+
+            def validate(self, ctx, result):
+                from pipeline_transcriber.models.stage import ValidationResult
+                return ValidationResult(ok=True, checks=[])
+
+            def can_retry(self, error, ctx):
+                return True
+
+            def suggest_fallback(self, attempt, ctx):
+                return {}
+
+        def _legacy_build(config, job=None):
+            return [OkStage()]
+
+        with patch("pipeline_transcriber.orchestrator.build_stage_sequence", _legacy_build):
+            with patch.object(FinalizeReportStage, "run", side_effect=RuntimeError("disk exploded")):
+                orch = Orchestrator(cfg)
+                report = orch.run_batch([job])
+
+        assert report["success"] == 1
+        state_path = Path(cfg.app.work_dir) / job.job_id / "state.json"
+        state = json.loads(state_path.read_text())
+        assert state["status"] == "success"
+        assert state["finalization_status"] == "failed"
+        final_entry = next(
+            entry for entry in state["stage_ledger"]
+            if entry["stage_name"] == "FINALIZE_REPORT"
+        )
+        assert final_entry["status"] == "failed"
 
 
 # ===========================================================================

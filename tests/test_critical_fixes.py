@@ -533,9 +533,11 @@ class TestLedgerRecording:
         # Check state.json has ledger
         state_path = cfg.app.work_dir / "test-job-01" / "state.json"
         state = json.loads(state_path.read_text())
-        assert len(state["stage_ledger"]) == 1
+        assert len(state["stage_ledger"]) == 2
         assert state["stage_ledger"][0]["stage_name"] == "INPUT_VALIDATE"
         assert state["stage_ledger"][0]["status"] == "success"
+        assert state["stage_ledger"][1]["stage_name"] == "FINALIZE_REPORT"
+        assert state["stage_ledger"][1]["status"] == "success"
 
     def test_failed_stage_in_ledger(self, tmp_path: Path):
         cfg = make_config(tmp_path)
@@ -551,9 +553,11 @@ class TestLedgerRecording:
         assert report["failed"] == 1
         state_path = cfg.app.work_dir / "test-job-01" / "state.json"
         state = json.loads(state_path.read_text())
-        assert len(state["stage_ledger"]) == 1
+        assert len(state["stage_ledger"]) == 2
         assert state["stage_ledger"][0]["status"] == "failed"
         assert "boom" in state["stage_ledger"][0]["error"]
+        assert state["stage_ledger"][1]["stage_name"] == "FINALIZE_REPORT"
+        assert state["stage_ledger"][1]["status"] == "success"
 
 
 # ---------------------------------------------------------------------------

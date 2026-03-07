@@ -85,8 +85,10 @@ class Orchestrator:
             batch_id=self.batch_id, trace_id=trace_id,
         )
 
-        stages = build_stage_sequence(job_config, job)
-        new_plan = [s.stage_name.value for s in stages]
+        stage_sequence = build_stage_sequence(job_config, job)
+        stages, finalization_stages = self._split_stage_sequence(stage_sequence)
+        full_stage_sequence = stages + finalization_stages
+        new_plan = [s.stage_name.value for s in full_stage_sequence]
 
         # Save canonical state fields
         job_dict = job.model_dump(mode="json")
@@ -153,24 +155,16 @@ class Orchestrator:
 
         # Hydrate ctx fields for completed stages on resume
         if resume and state.completed_stages:
-            self._hydrate_completed_stages(stages, ctx, state, log)
+            self._hydrate_completed_stages(full_stage_sequence, ctx, state, log)
 
         # Track which stages have restored ledger entries
         restored_stages = {e.stage_name for e in ctx.stage_ledger}
 
         try:
             for stage in stages:
-                if resume and stage.stage_name.value in state.completed_stages:
-                    # Only add skip entry if not already in restored ledger
-                    if stage.stage_name.value not in restored_stages:
-                        log.info("stage_skipped_resume", stage=stage.stage_name.value)
-                        ctx.stage_ledger.append(StageEntry(
-                            stage_name=stage.stage_name.value,
-                            status="skipped",
-                            skip_reason="resumed",
-                        ))
-                    else:
-                        log.info("stage_skipped_resume", stage=stage.stage_name.value)
+                if resume and self._resume_skip_stage(
+                    stage.stage_name.value, state, restored_stages, ctx, log,
+                ):
                     continue
 
                 stage_result = self._run_stage(stage, ctx, state, log)
@@ -180,27 +174,28 @@ class Orchestrator:
                         continue
                     break
         finally:
-            # Guaranteed finalization: always compute status, save ledger, write report
-            job_status = compute_job_status(
-                ctx.stage_ledger,
-                lambda name: self._is_optional_stage_by_name(name, job),
-            )
+            # Guaranteed finalization: always compute base status, write safety-net,
+            # then run finalization stages as their own lifecycle.
+            job_status = self._compute_main_job_status(ctx.stage_ledger, job)
 
             state.set_ledger([e.model_dump() for e in ctx.stage_ledger])
-            state.mark_job_finished(job_status)
 
             # Phase 1: Safety-net artifacts (individual try/except per file)
             self._write_safety_net_artifacts(ctx, job_status, log)
 
-            # Phase 2: Full finalizer enriches artifacts
-            try:
-                from pipeline_transcriber.stages.finalize import FinalizeReportStage
-                finalizer = FinalizeReportStage()
-                finalizer.run(ctx, job_status=job_status)
-                state.finalization_status = "success"
-            except Exception as finalize_exc:
-                state.finalization_status = "failed"
-                log.error("finalize_failed", error=str(finalize_exc))
+            # Phase 2: Full finalization stages run through the normal stage contract.
+            for stage in finalization_stages:
+                if resume and self._resume_skip_stage(
+                    stage.stage_name.value, state, restored_stages, ctx, log,
+                ):
+                    continue
+                self._run_stage(stage, ctx, state, log, job_status=job_status)
+
+            state.set_ledger([e.model_dump() for e in ctx.stage_ledger])
+            state.finalization_status = self._compute_finalization_status(
+                ctx.stage_ledger, finalization_stages,
+            )
+            state.mark_job_finished(job_status)
             state._save()
 
             log.info("job_finished", status=job_status,
@@ -209,7 +204,8 @@ class Orchestrator:
         return job_status
 
     def _run_stage(self, stage: BaseStage, ctx: StageContext,
-                   state: JobState, log: Any) -> str:
+                   state: JobState, log: Any,
+                   job_status: str | None = None) -> str:
         stage_name = stage.stage_name.value
         state.mark_stage_started(stage_name)
         log.info("stage_started", stage=stage_name)
@@ -217,7 +213,7 @@ class Orchestrator:
 
         try:
             result, attempts = run_with_retry(
-                func=lambda s=stage: s.run(ctx),
+                func=lambda s=stage: self._run_stage_with_context(s, ctx, job_status),
                 validate_func=lambda r, s=stage: s.validate(ctx, r),
                 can_retry_func=lambda err, s=stage: s.can_retry(err, ctx),
                 suggest_fallback_func=lambda att, s=stage: s.suggest_fallback(att, ctx),
@@ -250,6 +246,8 @@ class Orchestrator:
                 warnings=result.warnings,
                 artifacts=result.artifacts,
             ))
+            if self._is_finalization_stage_name(stage_name) and job_status is not None:
+                self._refresh_finalization_artifacts(ctx, job_status)
 
             self._write_stage_feedback(ctx, stage_name, result, attempts, True)
             log.info("stage_succeeded", stage=stage_name,
@@ -271,6 +269,8 @@ class Orchestrator:
                 error=error_msg,
                 error_type=type(exc).__name__,
             ))
+            if self._is_finalization_stage_name(stage_name):
+                log.error("finalize_failed", error=error_msg)
 
             log.error("stage_failed", stage=stage_name,
                       duration_ms=duration_ms, error=error_msg,
@@ -296,6 +296,14 @@ class Orchestrator:
                 False, validation_checks,
             )
             return "failed"
+
+    @staticmethod
+    def _run_stage_with_context(
+        stage: BaseStage, ctx: StageContext, job_status: str | None,
+    ) -> Any:
+        if stage.stage_name.value == "FINALIZE_REPORT":
+            return stage.run(ctx, job_status=job_status or "success")
+        return stage.run(ctx)
 
     def _write_stage_feedback(self, ctx: StageContext, stage_name: str,
                               result: Any, attempts: int, success: bool,
@@ -358,6 +366,156 @@ class Orchestrator:
         if name in (StageName.SPEAKER_DIARIZATION, StageName.SPEAKER_ASSIGNMENT):
             return not job.enable_diarization
         return False
+
+    @staticmethod
+    def _is_finalization_stage_name(stage_name: str) -> bool:
+        return stage_name == "FINALIZE_REPORT"
+
+    def _split_stage_sequence(
+        self, stages: list[BaseStage],
+    ) -> tuple[list[BaseStage], list[BaseStage]]:
+        """Split stages into main and finalization lifecycles.
+
+        Backward compatibility: if a custom or mocked sequence omits the finalizer,
+        inject the default FinalizeReportStage so guaranteed finalization still holds.
+        """
+        main_stages: list[BaseStage] = []
+        finalization_stages: list[BaseStage] = []
+
+        for stage in stages:
+            if self._is_finalization_stage_name(stage.stage_name.value):
+                finalization_stages.append(stage)
+            else:
+                main_stages.append(stage)
+
+        if not finalization_stages:
+            from pipeline_transcriber.stages.finalize import FinalizeReportStage
+            finalization_stages.append(FinalizeReportStage())
+
+        return main_stages, finalization_stages
+
+    def _resume_skip_stage(
+        self, stage_name: str, state: JobState, restored_stages: set[str],
+        ctx: StageContext, log: Any,
+    ) -> bool:
+        if stage_name not in state.completed_stages:
+            return False
+
+        # Only add skip entry if not already in restored ledger.
+        if stage_name not in restored_stages:
+            ctx.stage_ledger.append(StageEntry(
+                stage_name=stage_name,
+                status="skipped",
+                skip_reason="resumed",
+            ))
+        log.info("stage_skipped_resume", stage=stage_name)
+        return True
+
+    def _compute_main_job_status(self, ledger: list[StageEntry], job: Job) -> str:
+        latest_entries = self._latest_stage_entries(ledger)
+        main_entries = [
+            entry for entry in latest_entries
+            if not self._is_finalization_stage_name(entry.stage_name)
+        ]
+        if not main_entries:
+            return "failed"
+        return compute_job_status(
+            main_entries,
+            lambda name: self._is_optional_stage_by_name(name, job),
+        )
+
+    def _compute_finalization_status(
+        self, ledger: list[StageEntry], finalization_stages: list[BaseStage],
+    ) -> str:
+        finalization_names = {stage.stage_name.value for stage in finalization_stages}
+        latest_entries = self._latest_stage_entries(ledger)
+        finalization_entries = [
+            entry for entry in latest_entries if entry.stage_name in finalization_names
+        ]
+        if not finalization_entries:
+            return "failed"
+        if any(entry.status == "failed" for entry in finalization_entries):
+            return "failed"
+        return "success"
+
+    @staticmethod
+    def _latest_stage_entries(ledger: list[StageEntry]) -> list[StageEntry]:
+        latest_by_stage: dict[str, StageEntry] = {}
+        stage_order: list[str] = []
+
+        for entry in ledger:
+            if entry.stage_name not in latest_by_stage:
+                stage_order.append(entry.stage_name)
+            latest_by_stage[entry.stage_name] = entry
+
+        return [latest_by_stage[stage_name] for stage_name in stage_order]
+
+    @staticmethod
+    def _refresh_finalization_artifacts(ctx: StageContext, job_status: str) -> None:
+        """Rewrite final artifacts after the finalizer entry is in the ledger.
+
+        ``FinalizeReportStage.run()`` writes report/final.json before the
+        orchestrator appends its own ``StageEntry``. Refresh the artifacts once
+        the ledger contains the finalization stage so the machine contract is
+        self-consistent.
+        """
+        from pipeline_transcriber.stages.finalize import FinalizeReportStage
+
+        stage_summaries = []
+        for entry in ctx.stage_ledger:
+            stage_summaries.append({
+                "stage": entry.stage_name,
+                "status": entry.status,
+                "attempts": entry.attempts,
+                "duration_ms": entry.duration_ms,
+                "warnings": entry.warnings,
+                "artifacts": entry.artifacts,
+                "error": entry.error,
+                "skip_reason": entry.skip_reason,
+            })
+
+        execution_contract: dict[str, object] = {
+            "outcome": FinalizeReportStage._build_execution_outcome(ctx, job_status).model_dump(),
+        }
+        if ctx.execution_plan is not None:
+            execution_contract["plan"] = ctx.execution_plan.model_dump()
+
+        report_path = ctx.job_dir / "report.json"
+        report = {}
+        if report_path.exists():
+            try:
+                report = json.loads(report_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                report = {}
+        report.update({
+            "job_id": ctx.job.job_id,
+            "batch_id": ctx.batch_id,
+            "trace_id": ctx.trace_id,
+            "status": job_status,
+            "stages": stage_summaries,
+            "total_stages": len(stage_summaries),
+            "finalized": True,
+            "execution": execution_contract,
+        })
+        FinalizeReportStage._atomic_write_json(report_path, report)
+
+        final_path = ctx.job_dir / "final.json"
+        final_data = {}
+        if final_path.exists():
+            try:
+                final_data = json.loads(final_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                final_data = {}
+        final_data.update({
+            "status": job_status,
+            "stage_ledger": stage_summaries,
+            "finalized": True,
+            "execution": execution_contract,
+        })
+        final_data.setdefault("job_id", ctx.job.job_id)
+        final_data.setdefault("source", ctx.job.source)
+        final_data.setdefault("source_type", ctx.job.source_type)
+        FinalizeReportStage._atomic_write_json(final_path, final_data)
 
     # ------------------------------------------------------------------
     # Execution contract
