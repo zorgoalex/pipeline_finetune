@@ -1,7 +1,9 @@
 """Core orchestrator - manages pipeline execution, retries, checkpoints, and alerts."""
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import shutil
 import time
 import uuid
 import structlog
@@ -34,8 +36,12 @@ class Orchestrator:
         self.results: dict[str, str] = {}
 
     def run_batch(self, jobs: list[Job], resume: bool = False) -> dict[str, Any]:
+        if resume and not self.config.app.resume_enabled:
+            raise ValueError("resume is disabled in config.app.resume_enabled")
+
         setup_logging(self.config.logging, self.batch_id)
         log = logger.bind(batch_id=self.batch_id)
+        self.results = {}
 
         # Validate no duplicate job_ids
         seen_ids: set[str] = set()
@@ -46,6 +52,19 @@ class Orchestrator:
 
         log.info("batch_started", total_jobs=len(jobs))
 
+        if self.config.app.max_parallel_jobs <= 1 or self.config.app.fail_fast_batch or len(jobs) <= 1:
+            self._run_batch_sequential(jobs, resume, log)
+        else:
+            self._run_batch_parallel(jobs, resume, log)
+
+        report = self._build_batch_report(jobs)
+        self._emit_batch_level_alerts(jobs, report)
+        self._save_batch_report(report)
+        log.info("batch_finished",
+                 success=report["success"], failed=report["failed"], partial=report["partial"])
+        return report
+
+    def _run_batch_sequential(self, jobs: list[Job], resume: bool, log: Any) -> None:
         for job in jobs:
             status = self._run_single_job(job, resume=resume)
             self.results[job.job_id] = status
@@ -53,11 +72,30 @@ class Orchestrator:
                 log.error("batch_aborted", failed_job=job.job_id)
                 break
 
-        report = self._build_batch_report(jobs)
-        self._save_batch_report(report)
-        log.info("batch_finished",
-                 success=report["success"], failed=report["failed"], partial=report["partial"])
-        return report
+    def _run_batch_parallel(self, jobs: list[Job], resume: bool, log: Any) -> None:
+        max_workers = min(self.config.app.max_parallel_jobs, len(jobs))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._run_single_job, job, resume): job
+                for job in jobs
+            }
+            for future in concurrent.futures.as_completed(futures):
+                job = futures[future]
+                try:
+                    status = future.result()
+                except Exception as exc:  # pragma: no cover - defensive batch wrapper
+                    status = "failed"
+                    log.error("job_future_failed", job_id=job.job_id, error=str(exc))
+                    self.alert_manager.send(
+                        job_id=job.job_id,
+                        stage="SYSTEM",
+                        severity=AlertSeverity.CRITICAL,
+                        error_code="SYSTEM_JOB_EXECUTION_ERROR",
+                        message=str(exc),
+                        attempts_used=0,
+                        trace_id=self.batch_id,
+                    )
+                self.results[job.job_id] = status
 
     def _run_single_job(self, job: Job, resume: bool = False) -> str:
         work_dir = Path(self.config.app.work_dir)
@@ -84,6 +122,8 @@ class Orchestrator:
             job=job, config=job_config, job_dir=job_dir,
             batch_id=self.batch_id, trace_id=trace_id,
         )
+        ctx.temp_dir = Path(job_config.app.tmp_dir) / job.job_id
+        ctx.temp_dir.mkdir(parents=True, exist_ok=True)
 
         stage_sequence = build_stage_sequence(job_config, job)
         stages, finalization_stages = self._split_stage_sequence(stage_sequence)
@@ -200,6 +240,9 @@ class Orchestrator:
             )
             state.mark_job_finished(job_status)
             state._save()
+            self._cleanup_job_temp(
+                ctx, full_stage_sequence, job_status, state.finalization_status, log,
+            )
 
             log.info("job_finished", status=job_status,
                      finalization_status=state.finalization_status)
@@ -252,7 +295,14 @@ class Orchestrator:
             if self._is_finalization_stage_name(stage_name) and job_status is not None:
                 self._refresh_finalization_artifacts(ctx, job_status)
 
-            self._write_stage_feedback(ctx, stage_name, result, attempts, True)
+            self._write_stage_feedback(
+                ctx,
+                stage_name,
+                result,
+                attempts,
+                True,
+                validation=result.validation,
+            )
             log.info("stage_succeeded", stage=stage_name,
                      duration_ms=duration_ms, attempts=attempts)
             return "success"
@@ -279,24 +329,33 @@ class Orchestrator:
                       duration_ms=duration_ms, error=error_msg,
                       exception_type=type(exc).__name__,
                       attempts_used=attempts_used)
+            alert_error_code = f"STAGE_FAILED_{stage_name.upper()}"
+            alert_severity = AlertSeverity.ERROR
+            if type(exc).__name__ == "HfTokenError":
+                alert_error_code = "MISSING_SECRET_HF_TOKEN"
+                alert_severity = AlertSeverity.CRITICAL
+
             self.alert_manager.send(
                 job_id=ctx.job.job_id, stage=stage_name,
-                severity=AlertSeverity.ERROR,
-                error_code=f"STAGE_FAILED_{stage_name.upper()}",
+                severity=alert_severity,
+                error_code=alert_error_code,
                 message=error_msg,
                 attempts_used=attempts_used,
                 trace_id=ctx.trace_id,
             )
             # Extract validation checks from StageValidationError if available
             validation_checks = None
+            validation = None
             if isinstance(exc, StageValidationError) and exc.validation:
+                validation = exc.validation
                 validation_checks = [
                     {"name": c.name, "passed": c.passed, "details": c.details}
                     for c in exc.validation.checks
                 ]
             self._write_stage_feedback(
                 ctx, stage_name, None, attempts_used,
-                False, validation_checks,
+                False, validation_checks, validation=validation,
+                error_message=error_msg,
             )
             return "failed"
 
@@ -310,7 +369,9 @@ class Orchestrator:
 
     def _write_stage_feedback(self, ctx: StageContext, stage_name: str,
                               result: Any, attempts: int, success: bool,
-                              validation_checks: list[dict] | None = None) -> None:
+                              validation_checks: list[dict] | None = None,
+                              validation: Any | None = None,
+                              error_message: str | None = None) -> None:
         feedback_dir = ctx.job_dir / "stage_feedback"
         feedback_dir.mkdir(parents=True, exist_ok=True)
 
@@ -318,18 +379,51 @@ class Orchestrator:
         checks: list[dict] = []
         if validation_checks is not None:
             checks = validation_checks
+        elif validation is not None:
+            checks = [
+                {"name": c.name, "passed": c.passed, "details": c.details}
+                for c in validation.checks
+            ]
         elif result is not None and hasattr(result, "validation") and result.validation is not None:
+            validation = result.validation
             checks = [
                 {"name": c.name, "passed": c.passed, "details": c.details}
                 for c in result.validation.checks
             ]
+
+        validation_ok = success
+        if validation is not None and hasattr(validation, "ok"):
+            validation_ok = validation.ok
+
+        expected_checks = [
+            {"name": check["name"], "passed": True}
+            for check in checks
+        ]
+        actual = {
+            "validation_ok": validation_ok,
+            "checks": checks,
+            "artifacts": result.artifacts if result and hasattr(result, "artifacts") else [],
+            "metrics": result.metrics if result and hasattr(result, "metrics") else {},
+        }
+        if error_message is not None:
+            actual["error"] = error_message
 
         feedback = {
             "stage": stage_name,
             "attempt": attempts,
             "status": "pass" if success else "fail",
             "retry_needed": not success,
+            "retry_reason": (
+                validation.retry_reason
+                if validation is not None and hasattr(validation, "retry_reason")
+                else None
+            ),
             "checks": checks,
+            "expected": {
+                "validation_ok": True,
+                "checks": expected_checks,
+            },
+            "actual": actual,
         }
         if result and hasattr(result, "artifacts"):
             feedback["artifacts"] = result.artifacts
@@ -464,32 +558,18 @@ class Orchestrator:
         """
         from pipeline_transcriber.stages.finalize import FinalizeReportStage
 
-        stage_summaries = []
-        for entry in ctx.stage_ledger:
-            stage_summaries.append({
-                "stage": entry.stage_name,
-                "status": entry.status,
-                "attempts": entry.attempts,
-                "duration_ms": entry.duration_ms,
-                "warnings": entry.warnings,
-                "artifacts": entry.artifacts,
-                "error": entry.error,
-                "skip_reason": entry.skip_reason,
-            })
+        stage_summaries = FinalizeReportStage._build_stage_summaries(ctx)
 
         execution_contract: dict[str, object] = {
             "outcome": FinalizeReportStage._build_execution_outcome(ctx, job_status).model_dump(),
         }
         if ctx.execution_plan is not None:
             execution_contract["plan"] = ctx.execution_plan.model_dump()
+        metrics = FinalizeReportStage._build_processing_metrics(ctx)
+        qa_report = FinalizeReportStage._load_optional_json(ctx.job_dir / "qa_report.json")
 
         report_path = ctx.job_dir / "report.json"
-        report = {}
-        if report_path.exists():
-            try:
-                report = json.loads(report_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                report = {}
+        report = FinalizeReportStage._load_optional_json(report_path)
         report.update({
             "job_id": ctx.job.job_id,
             "batch_id": ctx.batch_id,
@@ -499,25 +579,23 @@ class Orchestrator:
             "total_stages": len(stage_summaries),
             "finalized": True,
             "execution": execution_contract,
+            "metrics": metrics,
         })
+        if qa_report:
+            report["qa"] = qa_report
         FinalizeReportStage._atomic_write_json(report_path, report)
 
         final_path = ctx.job_dir / "final.json"
-        final_data = {}
-        if final_path.exists():
-            try:
-                final_data = json.loads(final_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                final_data = {}
-        final_data.update({
-            "status": job_status,
-            "stage_ledger": stage_summaries,
-            "finalized": True,
-            "execution": execution_contract,
-        })
-        final_data.setdefault("job_id", ctx.job.job_id)
-        final_data.setdefault("source", ctx.job.source)
-        final_data.setdefault("source_type", ctx.job.source_type)
+        final_data = FinalizeReportStage._load_optional_json(final_path)
+        final_data = FinalizeReportStage._enrich_final_json(
+            ctx=ctx,
+            final_data=final_data,
+            job_status=job_status,
+            stage_summaries=stage_summaries,
+            execution_contract=execution_contract,
+            metrics=metrics,
+            qa_report=qa_report,
+        )
         FinalizeReportStage._atomic_write_json(final_path, final_data)
 
     # ------------------------------------------------------------------
@@ -778,9 +856,14 @@ class Orchestrator:
         }
 
     def _build_batch_report(self, jobs: list[Job]) -> dict[str, Any]:
-        success = sum(1 for s in self.results.values() if s == "success")
-        failed = sum(1 for s in self.results.values() if s == "failed")
-        partial = sum(1 for s in self.results.values() if s == "partial")
+        ordered_results = {
+            job.job_id: self.results.get(job.job_id, "failed")
+            for job in jobs
+            if job.job_id in self.results or not self.config.app.fail_fast_batch
+        }
+        success = sum(1 for s in ordered_results.values() if s == "success")
+        failed = sum(1 for s in ordered_results.values() if s == "failed")
+        partial = sum(1 for s in ordered_results.values() if s == "partial")
         return {
             "batch_id": self.batch_id,
             "total": len(jobs),
@@ -788,7 +871,7 @@ class Orchestrator:
             "failed": failed,
             "partial": partial,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "jobs": dict(self.results),
+            "jobs": ordered_results,
         }
 
     def _save_batch_report(self, report: dict[str, Any]) -> None:
@@ -800,3 +883,61 @@ class Orchestrator:
         # Also save as latest for convenience
         latest_path = work_dir / "batch_report.json"
         latest_path.write_text(json.dumps(report, indent=2))
+
+    def _emit_batch_level_alerts(self, jobs: list[Job], report: dict[str, Any]) -> None:
+        ordered_statuses = [report["jobs"].get(job.job_id, "failed") for job in jobs if job.job_id in report["jobs"]]
+        max_failed_streak = 0
+        current_failed_streak = 0
+        for status in ordered_statuses:
+            if status == "failed":
+                current_failed_streak += 1
+                max_failed_streak = max(max_failed_streak, current_failed_streak)
+            else:
+                current_failed_streak = 0
+
+        if max_failed_streak >= 2:
+            self.alert_manager.send(
+                job_id=f"batch:{self.batch_id}",
+                stage="BATCH",
+                severity=AlertSeverity.CRITICAL,
+                error_code="BATCH_REPEATED_FAILURES",
+                message=f"Detected {max_failed_streak} consecutive failed jobs in batch {self.batch_id}",
+                attempts_used=0,
+                trace_id=self.batch_id,
+            )
+
+    def _cleanup_job_temp(
+        self,
+        ctx: StageContext,
+        stages: list[BaseStage],
+        job_status: str,
+        finalization_status: str | None,
+        log: Any,
+    ) -> None:
+        if ctx.temp_dir is None:
+            return
+
+        policy = ctx.config.app.cleanup_policy
+        should_cleanup = (
+            policy == "always"
+            or (
+                policy == "on_success"
+                and job_status == "success"
+                and finalization_status == "success"
+            )
+        )
+        if not should_cleanup:
+            return
+
+        for stage in stages:
+            try:
+                stage.cleanup_temp(ctx)
+            except Exception as exc:
+                log.warning("stage_temp_cleanup_failed", stage=stage.stage_name.value, error=str(exc))
+
+        try:
+            shutil.rmtree(ctx.temp_dir)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            log.warning("job_temp_cleanup_failed", temp_dir=str(ctx.temp_dir), error=str(exc))

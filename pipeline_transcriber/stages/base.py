@@ -19,6 +19,7 @@ class StageContext:
     job_dir: Path
     batch_id: str
     trace_id: str
+    temp_dir: Path | None = None
     stage_outputs: dict[str, StageResult] = field(default_factory=dict)
     stage_ledger: list[StageEntry] = field(default_factory=list)
     execution_plan: ExecutionPlan | None = None

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from pipeline_transcriber.models.alert import Alert, AlertSeverity
@@ -13,6 +15,7 @@ from pipeline_transcriber.models.config import (
     load_config,
 )
 from pipeline_transcriber.models.job import Job, load_jobs
+from pipeline_transcriber.orchestrator import Orchestrator
 from pipeline_transcriber.models.stage import (
     CheckResult,
     StageName,
@@ -93,6 +96,67 @@ class TestJob:
         assert len(jobs) == 2
         assert jobs[0].job_id == "demo-youtube-01"
         assert jobs[1].source_type == "local_file"
+
+    def test_load_jobs_json(self, tmp_path: Path) -> None:
+        jobs_path = tmp_path / "jobs.json"
+        jobs_path.write_text(json.dumps([
+            {"job_id": "job-json-1", "source_type": "local_file", "source": "/tmp/a.wav"},
+            {"job_id": "job-json-2", "source_type": "youtube", "source": "https://example.com/v"},
+        ]))
+
+        jobs = load_jobs(jobs_path)
+        assert [job.job_id for job in jobs] == ["job-json-1", "job-json-2"]
+
+    def test_load_jobs_json_object_with_jobs_key(self, tmp_path: Path) -> None:
+        jobs_path = tmp_path / "jobs.json"
+        jobs_path.write_text(json.dumps({
+            "jobs": [
+                {"job_id": "job-json-1", "source_type": "local_file", "source": "/tmp/a.wav"},
+            ]
+        }))
+
+        jobs = load_jobs(jobs_path)
+        assert len(jobs) == 1
+        assert jobs[0].job_id == "job-json-1"
+
+    def test_load_jobs_yaml(self, tmp_path: Path) -> None:
+        jobs_path = tmp_path / "jobs.yaml"
+        jobs_path.write_text(yaml.safe_dump({
+            "jobs": [
+                {"job_id": "job-yaml-1", "source_type": "local_file", "source": "/tmp/a.wav"},
+                {"job_id": "job-yaml-2", "source_type": "youtube", "source": "https://example.com/v"},
+            ]
+        }))
+
+        jobs = load_jobs(jobs_path)
+        assert [job.job_id for job in jobs] == ["job-yaml-1", "job-yaml-2"]
+
+    @pytest.mark.parametrize("suffix, writer", [
+        (".json", lambda path: path.write_text(json.dumps([
+            {"job_id": "dup-1", "source_type": "local_file", "source": "/tmp/a.wav"},
+            {"job_id": "dup-1", "source_type": "local_file", "source": "/tmp/b.wav"},
+        ]))),
+        (".yaml", lambda path: path.write_text(yaml.safe_dump({
+            "jobs": [
+                {"job_id": "dup-1", "source_type": "local_file", "source": "/tmp/a.wav"},
+                {"job_id": "dup-1", "source_type": "local_file", "source": "/tmp/b.wav"},
+            ]
+        }))),
+    ])
+    def test_duplicate_job_ids_still_fail_for_json_and_yaml_inputs(
+        self, tmp_path: Path, suffix: str, writer,
+    ) -> None:
+        jobs_path = tmp_path / f"jobs{suffix}"
+        writer(jobs_path)
+        jobs = load_jobs(jobs_path)
+
+        cfg = PipelineConfig()
+        cfg.app.work_dir = tmp_path / "output"
+        cfg.logging.log_dir = tmp_path / "logs"
+        cfg.alerts.alerts_file = tmp_path / "alerts.jsonl"
+
+        with pytest.raises(ValueError, match="Duplicate job_id"):
+            Orchestrator(cfg).run_batch(jobs)
 
     def test_job_with_expected_speakers(self) -> None:
         job = Job(

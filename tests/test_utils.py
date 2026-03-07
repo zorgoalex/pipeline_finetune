@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
+from pathlib import Path
 
 import pytest
+import structlog
 
 from pipeline_transcriber.models.alert import AlertSeverity
-from pipeline_transcriber.models.config import AlertsConfig, RetryConfig
+from pipeline_transcriber.models.config import AlertsConfig, LoggingConfig, RetryConfig
 from pipeline_transcriber.utils.alerts import AlertManager
+from pipeline_transcriber.utils.logging import setup_logging
 from pipeline_transcriber.utils.retry import run_with_retry
 from pipeline_transcriber.utils.secret_mask import _mask_recursive, _mask_value, mask_secrets
 from pipeline_transcriber.utils.state import JobState
@@ -157,6 +161,36 @@ class TestAlertManager:
         assert data["job_id"] == "job1"
         assert data["stage"] == "ASR"
         assert data["error_code"] == "ASR_TIMEOUT"
+
+
+class TestLoggingSetup:
+    def test_log_records_include_thread_field(self, tmp_path: Path) -> None:
+        cfg = LoggingConfig(log_dir=tmp_path / "logs", json=True)
+        setup_logging(cfg, batch_id="batch-1")
+
+        structlog.get_logger("phase3-test").bind(job_id="job-1", trace_id="t1").info("custom_event")
+
+        batch_log = cfg.log_dir / "batch_batch-1.jsonl"
+        entries = [json.loads(line) for line in batch_log.read_text().splitlines() if line.strip()]
+        assert entries
+        assert "thread" in entries[-1]
+
+    def test_rotation_and_retention(self, tmp_path: Path) -> None:
+        cfg = LoggingConfig(
+            log_dir=tmp_path / "logs",
+            json=True,
+            file_rotation_mb=1,
+            retention_count=2,
+        )
+        setup_logging(cfg, batch_id="rotate")
+
+        logger = logging.getLogger("phase3-rotation")
+        large_message = "x" * 250000
+        for i in range(18):
+            logger.info({"event": f"rotate_{i}", "payload": large_message, "job_id": "job-1", "trace_id": "t1"})
+
+        log_files = sorted(cfg.log_dir.glob("batch_rotate.jsonl*"))
+        assert len(log_files) <= 3
 
 
 # ---------------------------------------------------------------------------

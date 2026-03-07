@@ -428,10 +428,11 @@ class TestExportStageWithSegments:
 
         assert result.status == StageStatus.SUCCESS
         assert (ctx.job_dir / "final.json").exists()
+        assert (ctx.job_dir / "segments.jsonl").exists()
         assert (ctx.job_dir / "transcript.srt").exists()
         assert (ctx.job_dir / "transcript.vtt").exists()
         assert (ctx.job_dir / "transcript.txt").exists()
-        assert len(result.artifacts) == 4
+        assert len(result.artifacts) == 5
 
     def test_json_content(self, tmp_path: Path) -> None:
         ctx = _make_context(tmp_path)
@@ -506,6 +507,30 @@ class TestExportStageWithSegments:
                 # Dot in timecodes but no comma
                 assert "." in line
                 assert "," not in line
+
+    def test_csv_and_tsv_exports(self, tmp_path: Path) -> None:
+        ctx = _make_context(tmp_path)
+        ctx.job.output_formats = ["csv", "tsv"]
+        ctx.asr_result = {"segments": _segments_fixture()}
+
+        result = ExportStage().run(ctx)
+
+        assert result.status == StageStatus.SUCCESS
+        csv_path = ctx.job_dir / "transcript.csv"
+        tsv_path = ctx.job_dir / "transcript.tsv"
+        assert csv_path.exists()
+        assert tsv_path.exists()
+
+        csv_lines = csv_path.read_text().splitlines()
+        tsv_lines = tsv_path.read_text().splitlines()
+        assert csv_lines[0] == "segment_id,start,end,speaker,text,num_words"
+        assert tsv_lines[0] == "segment_id\tstart\tend\tspeaker\ttext\tnum_words"
+        assert "SPEAKER_00" in csv_lines[1]
+        assert "Hello world." in tsv_lines[1]
+
+        final_data = json.loads((ctx.job_dir / "final.json").read_text())
+        assert final_data["artifacts"]["csv"] == "transcript.csv"
+        assert final_data["artifacts"]["tsv"] == "transcript.tsv"
 
 
 class TestExportStageEmptySegments:

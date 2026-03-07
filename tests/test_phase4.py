@@ -615,6 +615,59 @@ class TestFinalJsonSchema:
         assert abs(spk_map["SPEAKER_01"]["total_duration"] - 5.0) < 0.01
 
 
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_build_all_11_stages)
+class TestPhase1DataContracts:
+    """Phase 1 data contract tests against the full mocked pipeline."""
+
+    def test_final_json_contains_phase1_contract_fields(self, _mock_stages, tmp_path: Path) -> None:
+        cfg = make_config(tmp_path, **{"alignment.enabled": True, "diarization.enabled": True})
+        orch = Orchestrator(cfg)
+        job = make_job(enable_diarization=True, enable_word_timestamps=True)
+
+        report = orch.run_batch([job])
+        assert report["success"] == 1
+
+        job_dir = Path(cfg.app.work_dir) / job.job_id
+        final_data = json.loads((job_dir / "final.json").read_text())
+        report_data = json.loads((job_dir / "report.json").read_text())
+        qa_report = json.loads((job_dir / "qa_report.json").read_text())
+
+        assert final_data["status"] == report_data["status"] == "success"
+        assert final_data["qa"] == qa_report
+        assert "metrics" in final_data
+        assert "processing_time_sec" in final_data["metrics"]
+        assert isinstance(final_data["metrics"]["processing_time_sec"], (int, float))
+        assert "rtf" in final_data["metrics"]
+        assert isinstance(final_data["metrics"]["rtf"], (int, float))
+        assert "config_snapshot" in final_data["pipeline"]
+        assert final_data["pipeline"]["config_snapshot"]["asr"]["model_name"] == cfg.asr.model_name
+
+    def test_root_segments_and_words_artifacts_are_written_and_advertised(
+        self, _mock_stages, tmp_path: Path,
+    ) -> None:
+        cfg = make_config(tmp_path, **{"alignment.enabled": True, "diarization.enabled": True})
+        orch = Orchestrator(cfg)
+        job = make_job(enable_diarization=True, enable_word_timestamps=True)
+
+        report = orch.run_batch([job])
+        assert report["success"] == 1
+
+        job_dir = Path(cfg.app.work_dir) / job.job_id
+        segments_path = job_dir / "segments.jsonl"
+        words_path = job_dir / "words.jsonl"
+        assert segments_path.exists()
+        assert words_path.exists()
+
+        segments_lines = [json.loads(line) for line in segments_path.read_text().splitlines() if line.strip()]
+        words_lines = [json.loads(line) for line in words_path.read_text().splitlines() if line.strip()]
+        assert len(segments_lines) == 2
+        assert len(words_lines) == 6
+
+        final_data = json.loads((job_dir / "final.json").read_text())
+        assert final_data["artifacts"]["segments_jsonl"] == "segments.jsonl"
+        assert final_data["artifacts"]["words_jsonl"] == "words.jsonl"
+
+
 # ===========================================================================
 # 4. E2E Smoke Test
 # ===========================================================================

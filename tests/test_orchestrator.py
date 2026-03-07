@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from unittest.mock import patch
 
+import os
 import pytest
 
 from pipeline_transcriber.models.config import PipelineConfig
@@ -16,6 +18,7 @@ from pipeline_transcriber.models.stage import (
 )
 from pipeline_transcriber.orchestrator import Orchestrator
 from pipeline_transcriber.stages.base import BaseStage, StageContext
+from pipeline_transcriber.stages.diarize import DiarizeStage
 
 
 # ---------------------------------------------------------------------------
@@ -35,13 +38,17 @@ def make_config(tmp_path: Path) -> PipelineConfig:
     return cfg
 
 
-def make_job(job_id: str = "test-job-01") -> Job:
-    return Job(
+def make_job(job_id: str = "test-job-01", **kwargs) -> Job:
+    defaults = dict(
         job_id=job_id,
         source_type="local_file",
         source="/tmp/test.wav",
         output_formats=["json", "txt"],
         enable_word_timestamps=False,  # alignment disabled in test config
+    )
+    defaults.update(kwargs)
+    return Job(
+        **defaults,
     )
 
 
@@ -171,6 +178,55 @@ class TestOrchestrator:
         feedback_files = list(feedback_dir.glob("*.json"))
         assert len(feedback_files) > 0
 
+    def test_stage_feedback_success_contract(self, mock_stages, tmp_path: Path) -> None:
+        cfg = make_config(tmp_path)
+        orch = Orchestrator(cfg)
+        job = make_job()
+        orch.run_batch([job])
+
+        feedback_path = Path(cfg.app.work_dir) / job.job_id / "stage_feedback" / "EXPORTER.json"
+        feedback = json.loads(feedback_path.read_text())
+
+        assert {"stage", "attempt", "status", "retry_needed", "retry_reason", "checks", "expected", "actual"} <= set(feedback)
+        assert feedback["status"] == "pass"
+        assert feedback["retry_reason"] is None
+        assert feedback["expected"]["validation_ok"] is True
+        assert feedback["actual"]["validation_ok"] is True
+        assert isinstance(feedback["actual"]["checks"], list)
+
+    def test_finalizer_feedback_uses_same_contract(self, mock_stages, tmp_path: Path) -> None:
+        cfg = make_config(tmp_path)
+        orch = Orchestrator(cfg)
+        job = make_job()
+        orch.run_batch([job])
+
+        feedback_path = Path(cfg.app.work_dir) / job.job_id / "stage_feedback" / "FINALIZE_REPORT.json"
+        feedback = json.loads(feedback_path.read_text())
+
+        assert {"expected", "actual", "retry_reason"} <= set(feedback)
+        assert feedback["stage"] == "FINALIZE_REPORT"
+        assert feedback["retry_reason"] is None
+
+    def test_stage_level_logs_include_contract_fields(self, mock_stages, tmp_path: Path) -> None:
+        cfg = make_config(tmp_path)
+        orch = Orchestrator(cfg)
+        job = make_job()
+        orch.run_batch([job])
+
+        job_log = cfg.logging.log_dir / f"job_{job.job_id}.jsonl"
+        lines = [json.loads(line) for line in job_log.read_text().splitlines() if line.strip()]
+        stage_events = [
+            line for line in lines
+            if line.get("event") in {"stage_started", "stage_succeeded", "stage_failed"}
+        ]
+
+        assert stage_events
+        sample = stage_events[0]
+        assert sample["job_id"] == job.job_id
+        assert "stage" in sample
+        assert "trace_id" in sample
+        assert "event" in sample
+
     def test_resume_skips_completed(self, mock_stages, tmp_path: Path) -> None:
         cfg = make_config(tmp_path)
         job = make_job()
@@ -197,6 +253,345 @@ class TestOrchestrator:
 
         required_keys = {"batch_id", "total", "success", "failed", "partial", "timestamp", "jobs"}
         assert required_keys.issubset(report.keys())
+
+    def test_resume_disabled_rejects_resume(self, mock_stages, tmp_path: Path) -> None:
+        cfg = make_config(tmp_path)
+        cfg.app.resume_enabled = False
+        orch = Orchestrator(cfg)
+
+        with pytest.raises(ValueError, match="resume is disabled"):
+            orch.run_batch([make_job()], resume=True)
+
+
+def _validation_failure_sequence(config, job=None):
+    from pipeline_transcriber.models.stage import StageName
+    from pipeline_transcriber.stages.input_validate import InputValidateStage
+    from pipeline_transcriber.stages.finalize import FinalizeReportStage
+
+    class ValidationFailureStage(BaseStage):
+        @property
+        def stage_name(self):
+            return StageName.ASR_TRANSCRIPTION
+
+        def run(self, ctx: StageContext) -> StageResult:
+            return StageResult(status=StageStatus.SUCCESS, artifacts=[], metrics={"num_segments": 0})
+
+        def validate(self, ctx, result):
+            return ValidationResult(
+                ok=False,
+                checks=[
+                    CheckResult(
+                        name="asr_segments_non_empty",
+                        passed=False,
+                        details="ASR produced no segments.",
+                    )
+                ],
+                retry_recommended=True,
+                retry_reason="ASR output was empty",
+            )
+
+        def can_retry(self, error, ctx):
+            return False
+
+    return [
+        InputValidateStage(),
+        ValidationFailureStage(),
+        FinalizeReportStage(),
+    ]
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_validation_failure_sequence)
+def test_stage_feedback_failure_contract_includes_retry_reason(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    orch = Orchestrator(cfg)
+    job = make_job()
+
+    report = orch.run_batch([job])
+    assert report["failed"] == 1
+
+    feedback_path = Path(cfg.app.work_dir) / job.job_id / "stage_feedback" / "ASR_TRANSCRIPTION.json"
+    feedback = json.loads(feedback_path.read_text())
+
+    assert feedback["status"] == "fail"
+    assert feedback["retry_needed"] is True
+    assert feedback["retry_reason"] == "ASR output was empty"
+    assert feedback["expected"]["validation_ok"] is True
+    assert feedback["actual"]["validation_ok"] is False
+    assert feedback["actual"]["checks"][0]["name"] == "asr_segments_non_empty"
+    assert feedback["actual"]["checks"][0]["passed"] is False
+
+
+def _sleep_stage_sequence(config, job=None):
+    from pipeline_transcriber.models.stage import StageName
+    from pipeline_transcriber.stages.input_validate import InputValidateStage
+    from pipeline_transcriber.stages.finalize import FinalizeReportStage
+
+    class SleepStage(BaseStage):
+        @property
+        def stage_name(self):
+            return StageName.DOWNLOAD
+
+        def run(self, ctx: StageContext) -> StageResult:
+            time.sleep(0.3)
+            return StageResult(status=StageStatus.SUCCESS, artifacts=[], metrics={})
+
+        def validate(self, ctx, result):
+            return ValidationResult(ok=True, checks=[])
+
+    return [
+        InputValidateStage(),
+        SleepStage(),
+        FinalizeReportStage(),
+    ]
+
+
+def _temp_stage_sequence(config, job=None):
+    from pipeline_transcriber.models.stage import StageName
+    from pipeline_transcriber.stages.input_validate import InputValidateStage
+    from pipeline_transcriber.stages.finalize import FinalizeReportStage
+
+    class TempStage(BaseStage):
+        @property
+        def stage_name(self):
+            return StageName.DOWNLOAD
+
+        def run(self, ctx: StageContext) -> StageResult:
+            scratch = ctx.temp_dir / "scratch.txt"
+            scratch.parent.mkdir(parents=True, exist_ok=True)
+            scratch.write_text("temp")
+            return StageResult(status=StageStatus.SUCCESS, artifacts=[str(scratch)], metrics={})
+
+        def validate(self, ctx, result):
+            return ValidationResult(ok=True, checks=[])
+
+        def cleanup_temp(self, ctx: StageContext) -> None:
+            marker = ctx.temp_dir / "cleanup_marker.txt"
+            marker.write_text("cleanup_called")
+
+    return [
+        InputValidateStage(),
+        TempStage(),
+        FinalizeReportStage(),
+    ]
+
+
+def _failing_temp_stage_sequence(config, job=None):
+    from pipeline_transcriber.models.stage import StageName
+    from pipeline_transcriber.stages.input_validate import InputValidateStage
+    from pipeline_transcriber.stages.finalize import FinalizeReportStage
+
+    class FailingTempStage(BaseStage):
+        @property
+        def stage_name(self):
+            return StageName.DOWNLOAD
+
+        def run(self, ctx: StageContext) -> StageResult:
+            scratch = ctx.temp_dir / "scratch.txt"
+            scratch.parent.mkdir(parents=True, exist_ok=True)
+            scratch.write_text("temp")
+            raise RuntimeError("boom")
+
+        def validate(self, ctx, result):
+            return ValidationResult(ok=True, checks=[])
+
+    return [
+        InputValidateStage(),
+        FailingTempStage(),
+        FinalizeReportStage(),
+    ]
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_sleep_stage_sequence)
+def test_parallel_batch_execution_is_faster_than_sequential(_mock_stages, tmp_path: Path) -> None:
+    jobs = [make_job("job-a"), make_job("job-b")]
+
+    cfg_seq = make_config(tmp_path / "seq")
+    cfg_seq.app.max_parallel_jobs = 1
+    t0 = time.monotonic()
+    Orchestrator(cfg_seq).run_batch(jobs)
+    sequential_duration = time.monotonic() - t0
+
+    cfg_par = make_config(tmp_path / "par")
+    cfg_par.app.max_parallel_jobs = 2
+    t1 = time.monotonic()
+    Orchestrator(cfg_par).run_batch(jobs)
+    parallel_duration = time.monotonic() - t1
+
+    assert sequential_duration > 0.5
+    assert parallel_duration < sequential_duration * 0.8
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_temp_stage_sequence)
+def test_cleanup_policy_always_removes_job_tmp_dir(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.cleanup_policy = "always"
+    cfg.app.tmp_dir = tmp_path / "tmp-work"
+
+    report = Orchestrator(cfg).run_batch([make_job()])
+    assert report["success"] == 1
+
+    assert not (cfg.app.tmp_dir / "test-job-01").exists()
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_failing_temp_stage_sequence)
+def test_cleanup_policy_on_success_keeps_tmp_dir_for_failed_job(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.cleanup_policy = "on_success"
+    cfg.app.tmp_dir = tmp_path / "tmp-work"
+
+    report = Orchestrator(cfg).run_batch([make_job()])
+    assert report["failed"] == 1
+
+    scratch = cfg.app.tmp_dir / "test-job-01" / "scratch.txt"
+    assert scratch.exists()
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_temp_stage_sequence)
+def test_cleanup_policy_never_keeps_tmp_dir_after_success(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.cleanup_policy = "never"
+    cfg.app.tmp_dir = tmp_path / "tmp-work"
+
+    report = Orchestrator(cfg).run_batch([make_job()])
+    assert report["success"] == 1
+
+    scratch = cfg.app.tmp_dir / "test-job-01" / "scratch.txt"
+    assert scratch.exists()
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_failing_temp_stage_sequence)
+def test_cleanup_policy_always_removes_tmp_dir_after_failure(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.cleanup_policy = "always"
+    cfg.app.tmp_dir = tmp_path / "tmp-work"
+
+    report = Orchestrator(cfg).run_batch([make_job()])
+    assert report["failed"] == 1
+    assert not (cfg.app.tmp_dir / "test-job-01").exists()
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_mock_build_stage_sequence)
+def test_parallel_batch_keeps_job_logs_isolated(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.max_parallel_jobs = 2
+    jobs = [make_job("job-a"), make_job("job-b")]
+
+    report = Orchestrator(cfg).run_batch(jobs)
+    assert report["success"] == 2
+
+    for job in jobs:
+        job_log = cfg.logging.log_dir / f"job_{job.job_id}.jsonl"
+        lines = [json.loads(line) for line in job_log.read_text().splitlines() if line.strip()]
+        logged_job_ids = {line.get("job_id") for line in lines if "job_id" in line}
+        assert logged_job_ids == {job.job_id}
+
+
+def _diarization_missing_secret_sequence(config, job=None):
+    from pipeline_transcriber.models.stage import StageName
+    from pipeline_transcriber.stages.input_validate import InputValidateStage
+    from pipeline_transcriber.stages.finalize import FinalizeReportStage
+
+    class AudioReadyStage(BaseStage):
+        @property
+        def stage_name(self):
+            return StageName.AUDIO_PREPARE
+
+        def run(self, ctx: StageContext) -> StageResult:
+            audio_dir = ctx.artifacts_dir / "audio"
+            audio_dir.mkdir(parents=True, exist_ok=True)
+            audio = audio_dir / "audio_16k_mono.wav"
+            audio.write_bytes(b"\x00" * 100)
+            ctx.audio_path = audio
+            return StageResult(status=StageStatus.SUCCESS, artifacts=[str(audio)], metrics={})
+
+        def validate(self, ctx, result):
+            return ValidationResult(ok=True, checks=[])
+
+    return [
+        InputValidateStage(),
+        AudioReadyStage(),
+        DiarizeStage(),
+        FinalizeReportStage(),
+    ]
+
+
+def _always_fail_sequence(config, job=None):
+    from pipeline_transcriber.models.stage import StageName
+    from pipeline_transcriber.stages.input_validate import InputValidateStage
+    from pipeline_transcriber.stages.finalize import FinalizeReportStage
+
+    class FailStage(BaseStage):
+        @property
+        def stage_name(self):
+            return StageName.ASR_TRANSCRIPTION
+
+        def run(self, ctx: StageContext) -> StageResult:
+            raise RuntimeError("permanent failure")
+
+        def validate(self, ctx, result):
+            return ValidationResult(ok=True, checks=[])
+
+        def can_retry(self, error, ctx):
+            return False
+
+    return [
+        InputValidateStage(),
+        FailStage(),
+        FinalizeReportStage(),
+    ]
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_diarization_missing_secret_sequence)
+def test_missing_secret_emits_specific_alert(_mock_stages, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
+
+    cfg = make_config(tmp_path)
+    cfg.diarization.enabled = True
+    job = make_job(enable_diarization=True)
+
+    report = Orchestrator(cfg).run_batch([job])
+    assert report["failed"] == 1
+
+    alerts = [
+        json.loads(line)
+        for line in cfg.alerts.alerts_file.read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(alert["error_code"] == "MISSING_SECRET_HF_TOKEN" for alert in alerts)
+
+
+@patch("pipeline_transcriber.orchestrator.Orchestrator._run_single_job", side_effect=RuntimeError("worker crashed"))
+def test_system_error_emits_alert(_mock_run_single_job, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.max_parallel_jobs = 2
+    jobs = [make_job("job-a"), make_job("job-b")]
+
+    report = Orchestrator(cfg).run_batch(jobs)
+    assert report["failed"] == 2
+
+    alerts = [
+        json.loads(line)
+        for line in cfg.alerts.alerts_file.read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(alert["error_code"] == "SYSTEM_JOB_EXECUTION_ERROR" for alert in alerts)
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_always_fail_sequence)
+def test_repeated_batch_failures_emit_batch_alert(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    jobs = [make_job("job-a"), make_job("job-b"), make_job("job-c")]
+
+    report = Orchestrator(cfg).run_batch(jobs)
+    assert report["failed"] == 3
+
+    alerts = [
+        json.loads(line)
+        for line in cfg.alerts.alerts_file.read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(alert["error_code"] == "BATCH_REPEATED_FAILURES" for alert in alerts)
 
 
 # ---------------------------------------------------------------------------

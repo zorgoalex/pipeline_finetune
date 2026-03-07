@@ -16,10 +16,10 @@ app = typer.Typer(name="pipeline", help="Transcription + diarization pipeline")
 @app.command()
 def batch(
     config: Path = typer.Option("config/config.example.yaml", "--config", "-c", help="Config YAML path"),
-    jobs_file: Path = typer.Option(..., "--jobs", "-j", help="Jobs JSONL path"),
+    jobs_file: Path = typer.Option(..., "--jobs", "-j", help="Jobs JSONL/JSON/YAML path"),
     resume: bool = typer.Option(False, "--resume", help="Resume from last checkpoint"),
 ) -> None:
-    """Process a batch of jobs from a JSONL file."""
+    """Process a batch of jobs from a JSONL, JSON, or YAML file."""
     cfg = load_config(config)
     jobs = load_jobs(jobs_file)
     orch = Orchestrator(cfg)

@@ -19,6 +19,10 @@ uv sync
 # Run batch processing
 pipeline batch --config config/config.example.yaml --jobs jobs/jobs.example.jsonl
 
+# JSON and YAML job lists are also supported
+pipeline batch --config config/config.example.yaml --jobs jobs/jobs.example.json
+pipeline batch --config config/config.example.yaml --jobs jobs/jobs.example.yaml
+
 # Run single file
 pipeline single /path/to/audio.wav
 
@@ -44,9 +48,22 @@ Copy `config/config.example.yaml` and customize. Key settings:
 - `asr.device` - cpu/cuda/auto
 - `diarization.enabled` - Speaker diarization toggle
 - `retry.max_attempts` - Max retries per stage (default: 5)
+- `app.max_parallel_jobs` - Number of jobs to run concurrently in batch mode
+- `app.resume_enabled` - Global switch for checkpoint resume
+- `app.cleanup_policy` - Temp directory cleanup policy (`on_success`, `always`, `never`)
 
 ## Execution Semantics
 - `FinalizeReportStage` is part of the canonical execution plan, but still runs in a guaranteed finalization contour via `finally`.
 - `--resume` can re-run only finalization when `final.json` / `report.json` are missing or corrupt, or after a previous finalizer failure.
 - `state.status` tracks the main pipeline outcome; `state.finalization_status` tracks whether finalization completed successfully.
 - Finalization failures are recorded explicitly in ledger and stage feedback, without masking the primary pipeline outcome.
+
+## I/O Contract
+- Batch job files can be provided as `JSONL`, `JSON`, or `YAML`.
+- Export supports `txt`, `srt`, `vtt`, `csv`, and `tsv`, plus mandatory `final.json`.
+- Root job directory also carries canonical `segments.jsonl`, and `words.jsonl` when word timings exist.
+
+## Observability
+- Structured logs include `event`, `ts`, `host`, `pid`, `thread`, and per-scope fields such as `batch_id`, `job_id`, `stage`, `trace_id`, `attempt`, and `duration_ms` where applicable.
+- Alerts are emitted not only for exhausted stage failures, but also for missing diarization secrets, worker/system execution failures, and repeated batch failure streaks.
+- Per-job temporary workspaces live under `app.tmp_dir/<job_id>` and are cleaned according to `app.cleanup_policy`.

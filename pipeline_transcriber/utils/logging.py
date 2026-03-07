@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 import sys
+import threading
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
@@ -14,10 +15,24 @@ from pipeline_transcriber.models.config import LoggingConfig
 from pipeline_transcriber.utils.secret_mask import mask_secrets
 
 
+class _JobIdFilter(logging.Filter):
+    def __init__(self, job_id: str):
+        super().__init__()
+        self.job_id = job_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "job_id", None) == self.job_id:
+            return True
+        if isinstance(record.msg, dict):
+            return record.msg.get("job_id") == self.job_id
+        return False
+
+
 def _add_process_info(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     """Add host and pid to every log event."""
     event_dict["host"] = socket.gethostname()
     event_dict["pid"] = os.getpid()
+    event_dict["thread"] = threading.current_thread().name
     return event_dict
 
 
@@ -127,6 +142,7 @@ def setup_job_logger(config: LoggingConfig, job_id: str) -> logging.Handler:
         backupCount=backup_count,
     )
     handler.setFormatter(formatter)
+    handler.addFilter(_JobIdFilter(job_id))
 
     root_logger = logging.getLogger()
     root_logger.addHandler(handler)
@@ -137,3 +153,4 @@ def remove_job_logger(handler: logging.Handler) -> None:
     """Remove a previously added job handler from the root logger."""
     root_logger = logging.getLogger()
     root_logger.removeHandler(handler)
+    handler.close()

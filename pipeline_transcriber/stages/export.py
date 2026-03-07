@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
+from typing import Any
 
 from pipeline_transcriber.models.stage import (
     CheckResult,
@@ -34,6 +36,16 @@ class ExportStage(BaseStage):
         )
 
         artifacts: list[str] = []
+
+        segments_jsonl_path = ctx.job_dir / "segments.jsonl"
+        self._write_jsonl(segments_jsonl_path, segments)
+        artifacts.append(str(segments_jsonl_path))
+
+        all_words = [word for seg in segments for word in seg.get("words", [])]
+        if all_words:
+            words_jsonl_path = ctx.job_dir / "words.jsonl"
+            self._write_jsonl(words_jsonl_path, all_words)
+            artifacts.append(str(words_jsonl_path))
 
         if "txt" in requested_formats:
             txt_path = ctx.job_dir / "transcript.txt"
@@ -74,6 +86,16 @@ class ExportStage(BaseStage):
             vtt_path.write_text("\n".join(vtt_lines), encoding="utf-8")
             artifacts.append(str(vtt_path))
 
+        if "csv" in requested_formats:
+            csv_path = ctx.job_dir / "transcript.csv"
+            self._write_delimited_segments(csv_path, segments, delimiter=",")
+            artifacts.append(str(csv_path))
+
+        if "tsv" in requested_formats:
+            tsv_path = ctx.job_dir / "transcript.tsv"
+            self._write_delimited_segments(tsv_path, segments, delimiter="\t")
+            artifacts.append(str(tsv_path))
+
         # Copy RTTM to job dir if diarization produced one
         rttm_path = ctx.artifacts_dir / "diarization" / "diarization_raw.rttm"
         if rttm_path.exists():
@@ -94,6 +116,27 @@ class ExportStage(BaseStage):
             artifacts=artifacts,
             metrics={"num_formats": len(requested_formats), "num_segments": len(segments)},
         )
+
+    @staticmethod
+    def _write_jsonl(path: Path, items: list[dict[str, Any]]) -> None:
+        with path.open("w", encoding="utf-8") as fh:
+            for item in items:
+                fh.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _write_delimited_segments(path: Path, segments: list[dict[str, Any]], delimiter: str) -> None:
+        with path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh, delimiter=delimiter)
+            writer.writerow(["segment_id", "start", "end", "speaker", "text", "num_words"])
+            for index, seg in enumerate(segments):
+                writer.writerow([
+                    seg.get("id", index),
+                    seg.get("start", 0.0),
+                    seg.get("end", 0.0),
+                    seg.get("speaker", ""),
+                    seg.get("text", ""),
+                    len(seg.get("words", [])),
+                ])
 
     def _build_final_json(self, ctx: StageContext, source: dict, segments: list) -> dict:
         """Build full final.json per spec section 9."""
@@ -134,15 +177,27 @@ class ExportStage(BaseStage):
             "audio": audio_info,
             "speakers": list(speakers.values()),
             "segments": segments,
+            "metrics": {
+                "num_segments": len(segments),
+            },
             "artifacts": self._discover_artifacts(ctx),
             "pipeline": {
                 "version": "0.1.0",
+                "config_snapshot": self._build_config_snapshot(ctx),
             },
         }
+
+    @staticmethod
+    def _build_config_snapshot(ctx: StageContext) -> dict[str, Any]:
+        return ctx.config.model_dump(mode="json")
 
     def _discover_artifacts(self, ctx: StageContext) -> dict[str, str]:
         """Build artifacts map dynamically from files actually on disk."""
         artifact_files = {
+            "segments_jsonl": "segments.jsonl",
+            "words_jsonl": "words.jsonl",
+            "csv": "transcript.csv",
+            "tsv": "transcript.tsv",
             "srt": "transcript.srt",
             "vtt": "transcript.vtt",
             "txt": "transcript.txt",
@@ -171,6 +226,8 @@ class ExportStage(BaseStage):
 
         # Check requested export formats
         format_map = {
+            "csv": "transcript.csv",
+            "tsv": "transcript.tsv",
             "txt": "transcript.txt",
             "srt": "transcript.srt",
             "vtt": "transcript.vtt",
