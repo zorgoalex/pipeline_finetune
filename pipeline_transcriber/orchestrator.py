@@ -181,7 +181,10 @@ class Orchestrator:
             state.set_ledger([e.model_dump() for e in ctx.stage_ledger])
 
             # Phase 1: Safety-net artifacts (individual try/except per file)
-            self._write_safety_net_artifacts(ctx, job_status, log)
+            try:
+                self._write_safety_net_artifacts(ctx, job_status, log)
+            except Exception as exc:
+                log.error("safety_net_failed", error=str(exc))
 
             # Phase 2: Full finalization stages run through the normal stage contract.
             for stage in finalization_stages:
@@ -693,6 +696,9 @@ class Orchestrator:
         self, stage_name: str, ctx: StageContext, log: Any,
     ) -> bool:
         """Load a single stage's artifacts into ctx. Returns True on success."""
+        if self._is_finalization_stage_name(stage_name):
+            return self._validate_finalization_artifacts(ctx, log)
+
         entries = self._HYDRATION_MAP.get(stage_name, [])
         if not entries:
             return True  # No artifacts to hydrate (e.g. INPUT_VALIDATE)
@@ -726,6 +732,23 @@ class Orchestrator:
             setattr(ctx, ctx_field, value)
             log.debug("resume_hydrated", stage=stage_name, field=ctx_field)
 
+        return True
+
+    @staticmethod
+    def _validate_finalization_artifacts(ctx: StageContext, log: Any) -> bool:
+        """Check that finalization artifacts exist and are valid JSON."""
+        for artifact_name in ("report.json", "final.json"):
+            artifact_path = ctx.job_dir / artifact_name
+            if not artifact_path.exists():
+                log.warning("resume_artifact_missing", stage="FINALIZE_REPORT",
+                            path=str(artifact_path))
+                return False
+            try:
+                json.loads(artifact_path.read_text())
+            except (json.JSONDecodeError, OSError) as exc:
+                log.warning("resume_artifact_corrupt", stage="FINALIZE_REPORT",
+                            path=str(artifact_path), error=str(exc))
+                return False
         return True
 
     @staticmethod

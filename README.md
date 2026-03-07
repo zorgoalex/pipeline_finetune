@@ -44,3 +44,9 @@ Copy `config/config.example.yaml` and customize. Key settings:
 - `asr.device` - cpu/cuda/auto
 - `diarization.enabled` - Speaker diarization toggle
 - `retry.max_attempts` - Max retries per stage (default: 5)
+
+## Execution Semantics
+- `FinalizeReportStage` is part of the canonical execution plan, but still runs in a guaranteed finalization contour via `finally`.
+- `--resume` can re-run only finalization when `final.json` / `report.json` are missing or corrupt, or after a previous finalizer failure.
+- `state.status` tracks the main pipeline outcome; `state.finalization_status` tracks whether finalization completed successfully.
+- Finalization failures are recorded explicitly in ledger and stage feedback, without masking the primary pipeline outcome.

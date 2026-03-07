@@ -14,9 +14,15 @@ import pytest
 from pipeline_transcriber.models.config import PipelineConfig
 from pipeline_transcriber.models.execution import ExecutionOutcome, ExecutionPlan
 from pipeline_transcriber.models.job import ExpectedSpeakers, Job
-from pipeline_transcriber.models.stage import StageEntry, StageName, StageResult, StageStatus
+from pipeline_transcriber.models.stage import (
+    StageEntry,
+    StageName,
+    StageResult,
+    StageStatus,
+    ValidationResult,
+)
 from pipeline_transcriber.orchestrator import Orchestrator
-from pipeline_transcriber.stages.base import StageContext
+from pipeline_transcriber.stages.base import BaseStage, StageContext
 from pipeline_transcriber.stages.finalize import FinalizeReportStage
 from pipeline_transcriber.utils.state import JobState
 
@@ -205,6 +211,23 @@ class TestCanonicalStateModel:
 # ===========================================================================
 
 class TestIndestructibleFinalization:
+
+    @staticmethod
+    def _make_ok_stage(name: StageName, call_counts: dict[str, int] | None = None) -> BaseStage:
+        class _Stage(BaseStage):
+            @property
+            def stage_name(self) -> StageName:
+                return name
+
+            def run(self, ctx):
+                if call_counts is not None:
+                    call_counts[name.value] = call_counts.get(name.value, 0) + 1
+                return StageResult(status=StageStatus.SUCCESS)
+
+            def validate(self, ctx, result):
+                return ValidationResult(ok=True, checks=[])
+
+        return _Stage()
 
     def test_safety_net_writes_minimal_report(self, tmp_path: Path):
         """_write_safety_net_artifacts creates report.json with finalized=False."""
@@ -478,6 +501,162 @@ class TestIndestructibleFinalization:
             if entry["stage_name"] == "FINALIZE_REPORT"
         )
         assert final_entry["status"] == "failed"
+
+    def test_resume_reruns_only_finalization_after_failed_finalizer(self, tmp_path: Path):
+        """Resume should skip main stages and rerun only finalization after prior finalizer failure."""
+        cfg = make_config(tmp_path)
+        job = make_job()
+        call_counts: dict[str, int] = {}
+        original_run = FinalizeReportStage.run
+
+        def _legacy_build(config, job=None):
+            return [self._make_ok_stage(StageName.INPUT_VALIDATE, call_counts)]
+
+        def flaky_finalizer(self, ctx, job_status="success"):
+            call_counts["FINALIZE_REPORT"] = call_counts.get("FINALIZE_REPORT", 0) + 1
+            if call_counts["FINALIZE_REPORT"] == 1:
+                raise RuntimeError("disk exploded")
+            return original_run(self, ctx, job_status=job_status)
+
+        with patch("pipeline_transcriber.orchestrator.build_stage_sequence", _legacy_build):
+            with patch.object(FinalizeReportStage, "run", new=flaky_finalizer):
+                orch1 = Orchestrator(cfg, batch_id="b1")
+                report1 = orch1.run_batch([job])
+                assert report1["success"] == 1
+
+                orch2 = Orchestrator(cfg, batch_id="b2")
+                report2 = orch2.run_batch([job], resume=True)
+
+        assert report2["success"] == 1
+        assert call_counts["INPUT_VALIDATE"] == 1
+        assert call_counts["FINALIZE_REPORT"] == 2
+
+        state_path = Path(cfg.app.work_dir) / job.job_id / "state.json"
+        state = json.loads(state_path.read_text())
+        assert state["status"] == "success"
+        assert state["finalization_status"] == "success"
+        assert "FINALIZE_REPORT" in state["completed_stages"]
+
+    def test_resume_invalidates_only_finalization_when_final_artifacts_corrupt(self, tmp_path: Path):
+        """Corrupt final/report artifacts should rerun finalization only."""
+        cfg = make_config(tmp_path)
+        job = make_job()
+        call_counts: dict[str, int] = {}
+        original_run = FinalizeReportStage.run
+
+        def _legacy_build(config, job=None):
+            return [self._make_ok_stage(StageName.INPUT_VALIDATE, call_counts)]
+
+        def counting_finalizer(self, ctx, job_status="success"):
+            call_counts["FINALIZE_REPORT"] = call_counts.get("FINALIZE_REPORT", 0) + 1
+            return original_run(self, ctx, job_status=job_status)
+
+        with patch("pipeline_transcriber.orchestrator.build_stage_sequence", _legacy_build):
+            with patch.object(FinalizeReportStage, "run", new=counting_finalizer):
+                orch1 = Orchestrator(cfg, batch_id="b1")
+                report1 = orch1.run_batch([job])
+                assert report1["success"] == 1
+
+                job_dir = Path(cfg.app.work_dir) / job.job_id
+                (job_dir / "final.json").write_text("{corrupt")
+                (job_dir / "report.json").write_text("{corrupt")
+
+                orch2 = Orchestrator(cfg, batch_id="b2")
+                report2 = orch2.run_batch([job], resume=True)
+
+        assert report2["success"] == 1
+        assert call_counts["INPUT_VALIDATE"] == 1
+        assert call_counts["FINALIZE_REPORT"] == 2
+
+        state_path = Path(cfg.app.work_dir) / job.job_id / "state.json"
+        state = json.loads(state_path.read_text())
+        assert state["status"] == "success"
+        assert state["finalization_status"] == "success"
+
+    def test_safety_net_failure_does_not_block_finalizer(self, tmp_path: Path):
+        """Unexpected safety-net failure should not prevent finalization stages from running."""
+        cfg = make_config(tmp_path)
+        job = make_job()
+        original_run = FinalizeReportStage.run
+        call_counts: dict[str, int] = {}
+
+        def _legacy_build(config, job=None):
+            return [self._make_ok_stage(StageName.INPUT_VALIDATE, call_counts)]
+
+        def counting_finalizer(self, ctx, job_status="success"):
+            call_counts["FINALIZE_REPORT"] = call_counts.get("FINALIZE_REPORT", 0) + 1
+            return original_run(self, ctx, job_status=job_status)
+
+        with patch("pipeline_transcriber.orchestrator.build_stage_sequence", _legacy_build):
+            with patch.object(Orchestrator, "_write_safety_net_artifacts", side_effect=RuntimeError("safety-net crashed")):
+                with patch.object(FinalizeReportStage, "run", new=counting_finalizer):
+                    orch = Orchestrator(cfg)
+                    report = orch.run_batch([job])
+
+        assert report["success"] == 1
+        assert call_counts["INPUT_VALIDATE"] == 1
+        assert call_counts["FINALIZE_REPORT"] == 1
+
+        state_path = Path(cfg.app.work_dir) / job.job_id / "state.json"
+        state = json.loads(state_path.read_text())
+        assert state["status"] == "success"
+        assert state["finalization_status"] == "success"
+
+    def test_partial_status_propagates_into_final_contract(self, tmp_path: Path):
+        """Successful finalization should preserve a partial main-pipeline outcome in final artifacts."""
+        cfg = make_config(tmp_path)
+        cfg.vad.enabled = True
+        job = make_job()
+
+        class FailVadStage(BaseStage):
+            @property
+            def stage_name(self) -> StageName:
+                return StageName.VAD_SEGMENTATION
+
+            def run(self, ctx):
+                raise RuntimeError("vad exploded")
+
+            def validate(self, ctx, result):
+                return ValidationResult(ok=True, checks=[])
+
+            def can_retry(self, error, ctx):
+                return False
+
+        def _build(config, job=None):
+            return [
+                self._make_ok_stage(StageName.INPUT_VALIDATE),
+                FailVadStage(),
+            ]
+
+        with patch("pipeline_transcriber.orchestrator.build_stage_sequence", _build):
+            orch = Orchestrator(cfg)
+            report = orch.run_batch([job])
+
+        assert report["partial"] == 1
+        job_dir = Path(cfg.app.work_dir) / job.job_id
+        final_data = json.loads((job_dir / "final.json").read_text())
+        report_data = json.loads((job_dir / "report.json").read_text())
+        assert final_data["status"] == "partial"
+        assert report_data["status"] == "partial"
+
+    def test_finalizer_failure_writes_failure_feedback(self, tmp_path: Path):
+        """Finalizer failure should still create stage feedback with fail status."""
+        cfg = make_config(tmp_path)
+        job = make_job()
+
+        def _legacy_build(config, job=None):
+            return [self._make_ok_stage(StageName.INPUT_VALIDATE)]
+
+        with patch("pipeline_transcriber.orchestrator.build_stage_sequence", _legacy_build):
+            with patch.object(FinalizeReportStage, "run", side_effect=RuntimeError("disk exploded")):
+                orch = Orchestrator(cfg)
+                report = orch.run_batch([job])
+
+        assert report["success"] == 1
+        feedback_path = Path(cfg.app.work_dir) / job.job_id / "stage_feedback" / "FINALIZE_REPORT.json"
+        feedback = json.loads(feedback_path.read_text())
+        assert feedback["status"] == "fail"
+        assert feedback["retry_needed"] is True
 
 
 # ===========================================================================
