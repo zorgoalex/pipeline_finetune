@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -182,6 +184,57 @@ class TestAlertManager:
 
         assert not alerts_file.exists()
 
+    def test_concurrent_alert_writes_remain_valid_jsonl(self, tmp_path: object) -> None:
+        alerts_file = tmp_path / "alerts.jsonl"
+        config = AlertsConfig(enabled=True, channels=["jsonl"], alerts_file=alerts_file)
+        manager = AlertManager(config)
+        real_open = open
+
+        class SlowAppendProxy:
+            def __init__(self, path):
+                self.path = path
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def write(self, data: str) -> int:
+                for ch in data:
+                    with real_open(self.path, "a") as fh:
+                        fh.write(ch)
+                    time.sleep(0.00005)
+                return len(data)
+
+        def slow_open(path, mode="r", *args, **kwargs):
+            if path == alerts_file and mode == "a":
+                return SlowAppendProxy(path)
+            return real_open(path, mode, *args, **kwargs)
+
+        def send_alert(idx: int) -> None:
+            manager.send(
+                job_id=f"job-{idx}",
+                stage="DOWNLOAD",
+                severity=AlertSeverity.ERROR,
+                error_code=f"ERR_{idx}",
+                message="download failed",
+                attempts_used=1,
+                trace_id=f"trace-{idx}",
+            )
+
+        with patch("builtins.open", side_effect=slow_open):
+            threads = [threading.Thread(target=send_alert, args=(i,)) for i in range(10)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        lines = [line for line in alerts_file.read_text().splitlines() if line.strip()]
+        assert len(lines) == 10
+        parsed = [json.loads(line) for line in lines]
+        assert {item["job_id"] for item in parsed} == {f"job-{i}" for i in range(10)}
+
 
 class TestLoggingSetup:
     def test_log_records_include_thread_field(self, tmp_path: Path) -> None:
@@ -257,6 +310,28 @@ class TestLoggingSetup:
         assert "first" in batch1_events
         assert "first_after_second_setup" in batch1_events
         assert "second" in batch2_events
+
+    def test_different_batch_handlers_do_not_accumulate_after_cleanup(self, tmp_path: Path) -> None:
+        from pipeline_transcriber.utils.logging import cleanup_batch_logger
+
+        cfg = LoggingConfig(log_dir=tmp_path / "logs", json=True)
+        root_logger = logging.getLogger()
+
+        cleanup_batch_logger()
+
+        setup_logging(cfg, batch_id="batch-1")
+        setup_logging(cfg, batch_id="batch-2")
+        setup_logging(cfg, batch_id="batch-3")
+
+        cleanup_batch_logger("batch-1")
+        cleanup_batch_logger("batch-2")
+        cleanup_batch_logger("batch-3")
+
+        batch_handlers = [
+            handler for handler in root_logger.handlers
+            if getattr(handler, "_pipeline_transcriber_batch_id", None) is not None
+        ]
+        assert batch_handlers == []
 
 
 # ---------------------------------------------------------------------------

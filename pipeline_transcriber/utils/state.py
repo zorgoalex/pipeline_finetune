@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 
 
 STATE_FILENAME = "state.json"
+logger = logging.getLogger(__name__)
 
 
 class JobState:
@@ -107,7 +109,18 @@ class JobState:
         state = cls(job_id, job_dir)
         state_path = job_dir / STATE_FILENAME
         if state_path.exists():
-            data = json.loads(state_path.read_text())
+            try:
+                data = json.loads(state_path.read_text())
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning(
+                    {
+                        "event": "state_load_failed",
+                        "job_id": job_id,
+                        "state_path": str(state_path),
+                        "error": str(exc),
+                    }
+                )
+                return state
             state.completed_stages = data.get("completed_stages", [])
             state.current_stage = data.get("current_stage")
             state.status = data.get("status", "pending")

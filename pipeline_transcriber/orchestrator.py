@@ -23,7 +23,9 @@ from pipeline_transcriber.stages.base import BaseStage, StageContext
 from pipeline_transcriber.utils.state import JobState
 from pipeline_transcriber.utils.retry import run_with_retry
 from pipeline_transcriber.utils.alerts import AlertManager
-from pipeline_transcriber.utils.logging import setup_logging, setup_job_logger, remove_job_logger
+from pipeline_transcriber.utils.logging import (
+    setup_logging, setup_job_logger, remove_job_logger, cleanup_batch_logger,
+)
 
 logger = structlog.get_logger()
 
@@ -42,27 +44,29 @@ class Orchestrator:
         setup_logging(self.config.logging, self.batch_id)
         log = logger.bind(batch_id=self.batch_id)
         self.results = {}
+        try:
+            # Validate no duplicate job_ids
+            seen_ids: set[str] = set()
+            for job in jobs:
+                if job.job_id in seen_ids:
+                    raise ValueError(f"Duplicate job_id in batch: {job.job_id!r}")
+                seen_ids.add(job.job_id)
 
-        # Validate no duplicate job_ids
-        seen_ids: set[str] = set()
-        for job in jobs:
-            if job.job_id in seen_ids:
-                raise ValueError(f"Duplicate job_id in batch: {job.job_id!r}")
-            seen_ids.add(job.job_id)
+            log.info("batch_started", total_jobs=len(jobs))
 
-        log.info("batch_started", total_jobs=len(jobs))
+            if self.config.app.max_parallel_jobs <= 1 or self.config.app.fail_fast_batch or len(jobs) <= 1:
+                self._run_batch_sequential(jobs, resume, log)
+            else:
+                self._run_batch_parallel(jobs, resume, log)
 
-        if self.config.app.max_parallel_jobs <= 1 or self.config.app.fail_fast_batch or len(jobs) <= 1:
-            self._run_batch_sequential(jobs, resume, log)
-        else:
-            self._run_batch_parallel(jobs, resume, log)
-
-        report = self._build_batch_report(jobs)
-        self._emit_batch_level_alerts(jobs, report)
-        self._save_batch_report(report)
-        log.info("batch_finished",
-                 success=report["success"], failed=report["failed"], partial=report["partial"])
-        return report
+            report = self._build_batch_report(jobs)
+            self._emit_batch_level_alerts(jobs, report)
+            self._save_batch_report(report)
+            log.info("batch_finished",
+                     success=report["success"], failed=report["failed"], partial=report["partial"])
+            return report
+        finally:
+            cleanup_batch_logger(self.batch_id)
 
     def _run_batch_sequential(self, jobs: list[Job], resume: bool, log: Any) -> None:
         for job in jobs:
@@ -950,6 +954,14 @@ class Orchestrator:
             pass
         except Exception as exc:
             log.warning("job_temp_cleanup_failed", temp_dir=str(ctx.temp_dir), error=str(exc))
+            return
+
+        batch_tmp_dir = ctx.temp_dir.parent
+        try:
+            if batch_tmp_dir.exists() and not any(batch_tmp_dir.iterdir()):
+                batch_tmp_dir.rmdir()
+        except Exception as exc:
+            log.warning("batch_temp_cleanup_failed", temp_dir=str(batch_tmp_dir), error=str(exc))
 
     def _send_alert(
         self,
@@ -988,12 +1000,15 @@ class Orchestrator:
 
         trace_id = f"crash-{uuid.uuid4().hex[:12]}"
         job_dict = job.model_dump(mode="json")
-        state = JobState(job.job_id, job_dir)
-        state.config_hash = JobState.compute_config_hash(
-            self.config.model_dump(mode="json"),
-        )
-        state.job_hash = JobState.compute_config_hash(job_dict)
-        state.job_snapshot = job_dict
+        state = JobState.load(job.job_id, job_dir)
+        if not state.config_hash:
+            state.config_hash = JobState.compute_config_hash(
+                self.config.model_dump(mode="json"),
+            )
+        if not state.job_hash:
+            state.job_hash = JobState.compute_config_hash(job_dict)
+        if not state.job_snapshot:
+            state.job_snapshot = job_dict
 
         try:
             job_config = self.config.model_copy(deep=True)
@@ -1007,19 +1022,22 @@ class Orchestrator:
             state.execution_plan = []
 
         state.failed_stages = {
+            **state.failed_stages,
             "SYSTEM": {
                 "attempts": 0,
                 "error": str(exc),
             },
         }
-        state.stage_ledger = [StageEntry(
+        preserved_ledger = list(state.stage_ledger)
+        preserved_ledger.append(StageEntry(
             stage_name="SYSTEM",
             status="failed",
             attempts=0,
             duration_ms=0,
             error=str(exc),
             error_type=type(exc).__name__,
-        ).model_dump()]
+        ).model_dump())
+        state.stage_ledger = preserved_ledger
         state.finalization_status = "failed"
         state.mark_job_finished("failed")
 

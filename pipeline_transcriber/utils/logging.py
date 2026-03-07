@@ -177,3 +177,20 @@ def remove_job_logger(handler: logging.Handler) -> None:
     root_logger = logging.getLogger()
     root_logger.removeHandler(handler)
     handler.close()
+
+
+def cleanup_batch_logger(batch_id: str | None = None) -> None:
+    """Remove managed batch handlers from the root logger.
+
+    If ``batch_id`` is provided, only handlers for that batch are removed.
+    Otherwise all managed batch handlers are removed.
+    """
+    root_logger = logging.getLogger()
+    handlers_to_remove = [
+        handler for handler in list(root_logger.handlers)
+        if getattr(handler, "_pipeline_transcriber_batch_id", None) is not None
+        and (batch_id is None or getattr(handler, "_pipeline_transcriber_batch_id", None) == batch_id)
+    ]
+    for handler in handlers_to_remove:
+        root_logger.removeHandler(handler)
+        handler.close()

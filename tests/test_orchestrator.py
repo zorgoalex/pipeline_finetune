@@ -401,6 +401,34 @@ def _failing_temp_stage_sequence(config, job=None):
     ]
 
 
+def _mixed_temp_stage_sequence(config, job=None):
+    from pipeline_transcriber.models.stage import StageName
+    from pipeline_transcriber.stages.input_validate import InputValidateStage
+    from pipeline_transcriber.stages.finalize import FinalizeReportStage
+
+    class MixedTempStage(BaseStage):
+        @property
+        def stage_name(self):
+            return StageName.DOWNLOAD
+
+        def run(self, ctx: StageContext) -> StageResult:
+            scratch = ctx.temp_dir / "scratch.txt"
+            scratch.parent.mkdir(parents=True, exist_ok=True)
+            scratch.write_text("temp")
+            if ctx.job.job_id.endswith("fail"):
+                raise RuntimeError("boom")
+            return StageResult(status=StageStatus.SUCCESS, artifacts=[str(scratch)], metrics={})
+
+        def validate(self, ctx, result):
+            return ValidationResult(ok=True, checks=[])
+
+    return [
+        InputValidateStage(),
+        MixedTempStage(),
+        FinalizeReportStage(),
+    ]
+
+
 @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_sleep_stage_sequence)
 def test_parallel_batch_execution_is_faster_than_sequential(_mock_stages, tmp_path: Path) -> None:
     jobs = [make_job("job-a"), make_job("job-b")]
@@ -491,6 +519,34 @@ def test_same_job_id_different_batches_do_not_share_temp_dir(_mock_stages, tmp_p
     assert scratch_a != scratch_b
 
 
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_temp_stage_sequence)
+def test_cleanup_policy_removes_empty_batch_tmp_dir(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.cleanup_policy = "always"
+    cfg.app.tmp_dir = tmp_path / "tmp-work"
+    batch_id = "cleanup-parent"
+
+    report = Orchestrator(cfg, batch_id=batch_id).run_batch([make_job("job-a")])
+    assert report["success"] == 1
+    assert not (cfg.app.tmp_dir / batch_id).exists()
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_mixed_temp_stage_sequence)
+def test_cleanup_policy_preserves_batch_tmp_dir_when_sibling_job_remains(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.cleanup_policy = "on_success"
+    cfg.app.tmp_dir = tmp_path / "tmp-work"
+    batch_id = "cleanup-siblings"
+    jobs = [make_job("job-ok"), make_job("job-fail")]
+
+    report = Orchestrator(cfg, batch_id=batch_id).run_batch(jobs)
+    assert report["success"] == 1
+    assert report["failed"] == 1
+    assert (cfg.app.tmp_dir / batch_id).exists()
+    assert not (cfg.app.tmp_dir / batch_id / "job-ok").exists()
+    assert (cfg.app.tmp_dir / batch_id / "job-fail").exists()
+
+
 def test_fail_fast_batch_marks_unstarted_jobs_explicitly(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     cfg.app.fail_fast_batch = True
@@ -505,6 +561,26 @@ def test_fail_fast_batch_marks_unstarted_jobs_explicitly(tmp_path: Path) -> None
     assert report["jobs"]["job-a"] == "failed"
     assert report["jobs"]["job-b"] == "aborted_before_start"
     assert report["jobs"]["job-c"] == "aborted_before_start"
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_mock_build_stage_sequence)
+def test_run_batch_does_not_accumulate_batch_handlers(_mock_stages, tmp_path: Path) -> None:
+    import logging
+    from pipeline_transcriber.utils.logging import cleanup_batch_logger
+
+    cfg = make_config(tmp_path)
+    root_logger = logging.getLogger()
+    cleanup_batch_logger()
+
+    for batch_id in ("batch-a", "batch-b", "batch-c"):
+        report = Orchestrator(cfg, batch_id=batch_id).run_batch([make_job(f"{batch_id}-job")])
+        assert report["success"] == 1
+
+    batch_handlers = [
+        handler for handler in root_logger.handlers
+        if getattr(handler, "_pipeline_transcriber_batch_id", None) is not None
+    ]
+    assert batch_handlers == []
 
 
 @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_mock_build_stage_sequence)
@@ -675,6 +751,68 @@ def test_parallel_worker_crash_writes_minimal_job_contract(_mock_run_single_job,
         assert final_json["status"] == "failed"
         assert final_json["finalized"] is False
         assert final_json["job_id"] == job.job_id
+
+
+@patch("pipeline_transcriber.orchestrator.Orchestrator._run_single_job", side_effect=RuntimeError("worker crashed"))
+def test_parallel_worker_crash_preserves_existing_state_progress(_mock_run_single_job, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.max_parallel_jobs = 2
+    jobs = [make_job("job-a"), make_job("job-b")]
+    job = jobs[0]
+    job_dir = Path(cfg.app.work_dir) / job.job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_state = {
+        "job_id": job.job_id,
+        "completed_stages": ["INPUT_VALIDATE", "DOWNLOAD"],
+        "current_stage": None,
+        "status": "running",
+        "stage_attempts": {"INPUT_VALIDATE": 1, "DOWNLOAD": 1},
+        "failed_stages": {},
+        "stage_ledger": [
+            {"stage_name": "INPUT_VALIDATE", "status": "success", "attempts": 1, "duration_ms": 1},
+            {"stage_name": "DOWNLOAD", "status": "success", "attempts": 1, "duration_ms": 2},
+        ],
+        "finalization_status": None,
+        "execution_plan": ["INPUT_VALIDATE", "DOWNLOAD", "FINALIZE_REPORT"],
+        "config_hash": "cfg-hash",
+        "job_hash": "job-hash",
+        "job_snapshot": {"job_id": job.job_id, "source": job.source},
+        "updated_at": "2026-03-07T00:00:00+00:00",
+    }
+    (job_dir / "state.json").write_text(json.dumps(existing_state))
+
+    report = Orchestrator(cfg).run_batch(jobs)
+    assert report["failed"] == 2
+
+    state = json.loads((job_dir / "state.json").read_text())
+    assert state["completed_stages"] == ["INPUT_VALIDATE", "DOWNLOAD"]
+    assert state["config_hash"] == "cfg-hash"
+    assert state["job_hash"] == "job-hash"
+    assert state["stage_ledger"][0]["stage_name"] == "INPUT_VALIDATE"
+    assert state["stage_ledger"][-1]["stage_name"] == "SYSTEM"
+    assert state["stage_ledger"][-1]["status"] == "failed"
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_mock_build_stage_sequence)
+def test_corrupt_state_json_on_resume_falls_back_and_batch_continues(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    jobs = [make_job("job-a"), make_job("job-b")]
+
+    orch1 = Orchestrator(cfg, batch_id="first")
+    first_report = orch1.run_batch(jobs)
+    assert first_report["success"] == 2
+
+    job_a_dir = Path(cfg.app.work_dir) / "job-a"
+    (job_a_dir / "state.json").write_text("{corrupt")
+
+    orch2 = Orchestrator(cfg, batch_id="resume")
+    resumed_report = orch2.run_batch(jobs, resume=True)
+    assert resumed_report["success"] == 2
+
+    restored_state = json.loads((job_a_dir / "state.json").read_text())
+    assert restored_state["status"] == "success"
+    assert "INPUT_VALIDATE" in restored_state["completed_stages"]
 
 
 # ---------------------------------------------------------------------------
