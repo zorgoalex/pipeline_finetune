@@ -28,6 +28,18 @@ class _JobIdFilter(logging.Filter):
         return False
 
 
+class _BatchIdFilter(logging.Filter):
+    def __init__(self, batch_id: str):
+        super().__init__()
+        self.batch_id = batch_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        batch_id = getattr(record, "batch_id", None)
+        if batch_id is None and isinstance(record.msg, dict):
+            batch_id = record.msg.get("batch_id")
+        return batch_id is None or batch_id == self.batch_id
+
+
 def _add_process_info(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     """Add host and pid to every log event."""
     event_dict["host"] = socket.gethostname()
@@ -85,15 +97,22 @@ def setup_logging(
 
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, config.level))
-    # Clear existing handlers
-    root_logger.handlers.clear()
 
-    # 1. StreamHandler to stdout
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-    root_logger.addHandler(stream_handler)
+    # Keep non-managed handlers intact; replace only handlers owned by this setup.
+    if not any(getattr(h, "_pipeline_transcriber_stream", False) for h in root_logger.handlers):
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        stream_handler._pipeline_transcriber_stream = True
+        root_logger.addHandler(stream_handler)
 
-    # 2. RotatingFileHandler for batch log
+    existing_batch_handlers = [
+        handler for handler in list(root_logger.handlers)
+        if getattr(handler, "_pipeline_transcriber_batch_id", None) == batch_id
+    ]
+    for handler in existing_batch_handlers:
+        root_logger.removeHandler(handler)
+        handler.close()
+
     batch_log_path = log_dir / f"batch_{batch_id}.jsonl"
     batch_handler = RotatingFileHandler(
         batch_log_path,
@@ -101,6 +120,8 @@ def setup_logging(
         backupCount=backup_count,
     )
     batch_handler.setFormatter(formatter)
+    batch_handler.addFilter(_BatchIdFilter(batch_id))
+    batch_handler._pipeline_transcriber_batch_id = batch_id
     root_logger.addHandler(batch_handler)
 
     # 3. Optional per-job RotatingFileHandler
@@ -112,6 +133,7 @@ def setup_logging(
             backupCount=backup_count,
         )
         job_handler.setFormatter(formatter)
+        job_handler._pipeline_transcriber_job_id = job_id
         root_logger.addHandler(job_handler)
 
 
@@ -143,6 +165,7 @@ def setup_job_logger(config: LoggingConfig, job_id: str) -> logging.Handler:
     )
     handler.setFormatter(formatter)
     handler.addFilter(_JobIdFilter(job_id))
+    handler._pipeline_transcriber_job_id = job_id
 
     root_logger = logging.getLogger()
     root_logger.addHandler(handler)

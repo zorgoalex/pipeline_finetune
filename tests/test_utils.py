@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import structlog
@@ -162,6 +164,24 @@ class TestAlertManager:
         assert data["stage"] == "ASR"
         assert data["error_code"] == "ASR_TIMEOUT"
 
+    def test_alert_jsonl_write_error_is_swallowed(self, tmp_path: object) -> None:
+        alerts_file = tmp_path / "alerts.jsonl"
+        config = AlertsConfig(enabled=True, channels=["jsonl"], alerts_file=alerts_file)
+        manager = AlertManager(config)
+
+        with patch("builtins.open", side_effect=OSError("disk full")):
+            manager.send(
+                job_id="job1",
+                stage="DOWNLOAD",
+                severity=AlertSeverity.ERROR,
+                error_code="DL_FAIL",
+                message="download failed",
+                attempts_used=3,
+                trace_id="trace-1",
+            )
+
+        assert not alerts_file.exists()
+
 
 class TestLoggingSetup:
     def test_log_records_include_thread_field(self, tmp_path: Path) -> None:
@@ -191,6 +211,52 @@ class TestLoggingSetup:
 
         log_files = sorted(cfg.log_dir.glob("batch_rotate.jsonl*"))
         assert len(log_files) <= 3
+
+    def test_setup_logging_preserves_external_handlers(self, tmp_path: Path) -> None:
+        cfg = LoggingConfig(log_dir=tmp_path / "logs", json=True)
+        root_logger = logging.getLogger()
+        external = logging.StreamHandler(StringIO())
+        root_logger.addHandler(external)
+        try:
+            setup_logging(cfg, batch_id="batch-1")
+            setup_logging(cfg, batch_id="batch-2")
+            assert external in root_logger.handlers
+        finally:
+            root_logger.removeHandler(external)
+            external.close()
+
+    def test_setup_logging_replaces_only_same_batch_handler(self, tmp_path: Path) -> None:
+        cfg = LoggingConfig(log_dir=tmp_path / "logs", json=True)
+        root_logger = logging.getLogger()
+
+        setup_logging(cfg, batch_id="batch-1")
+        setup_logging(cfg, batch_id="batch-1")
+
+        batch_handlers = [
+            handler for handler in root_logger.handlers
+            if getattr(handler, "_pipeline_transcriber_batch_id", None) == "batch-1"
+        ]
+        assert len(batch_handlers) == 1
+
+    def test_second_batch_setup_keeps_first_batch_log_active(self, tmp_path: Path) -> None:
+        cfg = LoggingConfig(log_dir=tmp_path / "logs", json=True)
+
+        setup_logging(cfg, batch_id="batch-1")
+        structlog.get_logger("phase4-logging").bind(batch_id="batch-1", job_id="job-1", trace_id="t1").info("first")
+
+        setup_logging(cfg, batch_id="batch-2")
+        structlog.get_logger("phase4-logging").bind(batch_id="batch-1", job_id="job-1", trace_id="t1").info("first_after_second_setup")
+        structlog.get_logger("phase4-logging").bind(batch_id="batch-2", job_id="job-2", trace_id="t2").info("second")
+
+        batch1_log = cfg.log_dir / "batch_batch-1.jsonl"
+        batch2_log = cfg.log_dir / "batch_batch-2.jsonl"
+
+        batch1_events = [json.loads(line)["event"] for line in batch1_log.read_text().splitlines() if line.strip()]
+        batch2_events = [json.loads(line)["event"] for line in batch2_log.read_text().splitlines() if line.strip()]
+
+        assert "first" in batch1_events
+        assert "first_after_second_setup" in batch1_events
+        assert "second" in batch2_events
 
 
 # ---------------------------------------------------------------------------

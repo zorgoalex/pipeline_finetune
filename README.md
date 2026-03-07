@@ -57,6 +57,8 @@ Copy `config/config.example.yaml` and customize. Key settings:
 - `--resume` can re-run only finalization when `final.json` / `report.json` are missing or corrupt, or after a previous finalizer failure.
 - `state.status` tracks the main pipeline outcome; `state.finalization_status` tracks whether finalization completed successfully.
 - Finalization failures are recorded explicitly in ledger and stage feedback, without masking the primary pipeline outcome.
+- `fail_fast_batch=true` keeps unstarted jobs explicit in `batch_report.json` as `aborted_before_start` instead of omitting them.
+- Catastrophic worker-level failures in parallel mode still produce minimal per-job `state.json`, `report.json`, and `final.json`.
 
 ## I/O Contract
 - Batch job files can be provided as `JSONL`, `JSON`, or `YAML`.
@@ -65,5 +67,7 @@ Copy `config/config.example.yaml` and customize. Key settings:
 
 ## Observability
 - Structured logs include `event`, `ts`, `host`, `pid`, `thread`, and per-scope fields such as `batch_id`, `job_id`, `stage`, `trace_id`, `attempt`, and `duration_ms` where applicable.
+- Alerting is best-effort: alert sink failures are logged, but do not change pipeline/job outcomes or block finalization.
 - Alerts are emitted not only for exhausted stage failures, but also for missing diarization secrets, worker/system execution failures, and repeated batch failure streaks.
-- Per-job temporary workspaces live under `app.tmp_dir/<job_id>` and are cleaned according to `app.cleanup_policy`.
+- Per-job temporary workspaces live under `app.tmp_dir/<batch_id>/<job_id>` and are cleaned according to `app.cleanup_policy`.
+- Repair of corrupt `report.json` / `final.json` during finalization leaves a `repair_warnings` trail in the regenerated artifacts.

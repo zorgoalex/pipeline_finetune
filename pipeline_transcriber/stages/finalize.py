@@ -29,13 +29,8 @@ class FinalizeReportStage(BaseStage):
         stage_summaries = self._build_stage_summaries(ctx)
 
         # Enrich report.json (safety-net already wrote a minimal version)
-        report: dict[str, object] = {}
         report_path = ctx.job_dir / "report.json"
-        if report_path.exists():
-            try:
-                report = json.loads(report_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
+        report, report_repairs = self._load_repairable_json(report_path, log)
 
         report.update({
             "job_id": ctx.job.job_id,
@@ -63,13 +58,15 @@ class FinalizeReportStage(BaseStage):
         metrics = self._build_processing_metrics(ctx)
         report["execution"] = execution_contract
         report["metrics"] = metrics
+        if report_repairs:
+            report["repair_warnings"] = report_repairs
         self._atomic_write_json(report_path, report)
 
         artifacts = [str(report_path)]
 
         # Enrich final.json with honest status and ledger
         final_path = ctx.job_dir / "final.json"
-        final_data = self._load_optional_json(final_path)
+        final_data, final_repairs = self._load_repairable_json(final_path, log)
         final_data = self._enrich_final_json(
             ctx=ctx,
             final_data=final_data,
@@ -79,6 +76,8 @@ class FinalizeReportStage(BaseStage):
             metrics=metrics,
             qa_report=qa_report,
         )
+        if final_repairs:
+            final_data["repair_warnings"] = final_repairs
         self._atomic_write_json(final_path, final_data)
         log.info("final_json_enriched", status=job_status)
 
@@ -98,6 +97,36 @@ class FinalizeReportStage(BaseStage):
         except (json.JSONDecodeError, OSError):
             return {}
         return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _load_repairable_json(path: Path, log: Any) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        if not path.exists():
+            return {}, []
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning(
+                "finalization_artifact_repair_needed",
+                artifact=path.name,
+                error=str(exc),
+            )
+            return {}, [{
+                "artifact": path.name,
+                "reason": "corrupt_or_unreadable",
+                "error": str(exc),
+            }]
+        if isinstance(data, dict):
+            return data, []
+        log.warning(
+            "finalization_artifact_repair_needed",
+            artifact=path.name,
+            error="expected JSON object",
+        )
+        return {}, [{
+            "artifact": path.name,
+            "reason": "unexpected_json_type",
+            "error": "expected JSON object",
+        }]
 
     @staticmethod
     def _build_stage_summaries(ctx: StageContext) -> list[dict[str, object]]:

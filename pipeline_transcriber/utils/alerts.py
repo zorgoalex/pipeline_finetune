@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import sys
 from datetime import datetime, timezone
@@ -9,6 +10,8 @@ from uuid import uuid4
 
 from pipeline_transcriber.models.alert import Alert, AlertSeverity
 from pipeline_transcriber.models.config import AlertsConfig
+
+logger = logging.getLogger(__name__)
 
 
 class AlertManager:
@@ -47,10 +50,23 @@ class AlertManager:
         alert_json = alert.model_dump_json()
 
         for channel in self.config.channels:
-            if channel == "stderr":
-                print(alert_json, file=sys.stderr, flush=True)
-            elif channel == "jsonl":
-                alerts_file = self.config.alerts_file
-                alerts_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(alerts_file, "a") as fh:
-                    fh.write(alert_json + "\n")
+            try:
+                if channel == "stderr":
+                    print(alert_json, file=sys.stderr, flush=True)
+                elif channel == "jsonl":
+                    alerts_file = self.config.alerts_file
+                    alerts_file.parent.mkdir(parents=True, exist_ok=True)
+                    with open(alerts_file, "a") as fh:
+                        fh.write(alert_json + "\n")
+            except Exception as exc:  # pragma: no cover - defensive no-throw boundary
+                logger.warning(
+                    {
+                        "event": "alert_dispatch_failed",
+                        "job_id": job_id,
+                        "stage": stage,
+                        "error_code": error_code,
+                        "channel": channel,
+                        "error": str(exc),
+                        "trace_id": trace_id,
+                    }
+                )

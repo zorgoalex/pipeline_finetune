@@ -426,11 +426,12 @@ def test_cleanup_policy_always_removes_job_tmp_dir(_mock_stages, tmp_path: Path)
     cfg = make_config(tmp_path)
     cfg.app.cleanup_policy = "always"
     cfg.app.tmp_dir = tmp_path / "tmp-work"
+    batch_id = "cleanup-always"
 
-    report = Orchestrator(cfg).run_batch([make_job()])
+    report = Orchestrator(cfg, batch_id=batch_id).run_batch([make_job()])
     assert report["success"] == 1
 
-    assert not (cfg.app.tmp_dir / "test-job-01").exists()
+    assert not (cfg.app.tmp_dir / batch_id / "test-job-01").exists()
 
 
 @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_failing_temp_stage_sequence)
@@ -438,11 +439,12 @@ def test_cleanup_policy_on_success_keeps_tmp_dir_for_failed_job(_mock_stages, tm
     cfg = make_config(tmp_path)
     cfg.app.cleanup_policy = "on_success"
     cfg.app.tmp_dir = tmp_path / "tmp-work"
+    batch_id = "cleanup-failed"
 
-    report = Orchestrator(cfg).run_batch([make_job()])
+    report = Orchestrator(cfg, batch_id=batch_id).run_batch([make_job()])
     assert report["failed"] == 1
 
-    scratch = cfg.app.tmp_dir / "test-job-01" / "scratch.txt"
+    scratch = cfg.app.tmp_dir / batch_id / "test-job-01" / "scratch.txt"
     assert scratch.exists()
 
 
@@ -451,11 +453,12 @@ def test_cleanup_policy_never_keeps_tmp_dir_after_success(_mock_stages, tmp_path
     cfg = make_config(tmp_path)
     cfg.app.cleanup_policy = "never"
     cfg.app.tmp_dir = tmp_path / "tmp-work"
+    batch_id = "cleanup-never"
 
-    report = Orchestrator(cfg).run_batch([make_job()])
+    report = Orchestrator(cfg, batch_id=batch_id).run_batch([make_job()])
     assert report["success"] == 1
 
-    scratch = cfg.app.tmp_dir / "test-job-01" / "scratch.txt"
+    scratch = cfg.app.tmp_dir / batch_id / "test-job-01" / "scratch.txt"
     assert scratch.exists()
 
 
@@ -464,10 +467,44 @@ def test_cleanup_policy_always_removes_tmp_dir_after_failure(_mock_stages, tmp_p
     cfg = make_config(tmp_path)
     cfg.app.cleanup_policy = "always"
     cfg.app.tmp_dir = tmp_path / "tmp-work"
+    batch_id = "cleanup-always-fail"
 
-    report = Orchestrator(cfg).run_batch([make_job()])
+    report = Orchestrator(cfg, batch_id=batch_id).run_batch([make_job()])
     assert report["failed"] == 1
-    assert not (cfg.app.tmp_dir / "test-job-01").exists()
+    assert not (cfg.app.tmp_dir / batch_id / "test-job-01").exists()
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_temp_stage_sequence)
+def test_same_job_id_different_batches_do_not_share_temp_dir(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.cleanup_policy = "never"
+    cfg.app.tmp_dir = tmp_path / "tmp-work"
+    job = make_job("shared-job")
+
+    Orchestrator(cfg, batch_id="batch-a").run_batch([job])
+    Orchestrator(cfg, batch_id="batch-b").run_batch([job])
+
+    scratch_a = cfg.app.tmp_dir / "batch-a" / "shared-job" / "scratch.txt"
+    scratch_b = cfg.app.tmp_dir / "batch-b" / "shared-job" / "scratch.txt"
+    assert scratch_a.exists()
+    assert scratch_b.exists()
+    assert scratch_a != scratch_b
+
+
+def test_fail_fast_batch_marks_unstarted_jobs_explicitly(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.fail_fast_batch = True
+    jobs = [make_job("job-a"), make_job("job-b"), make_job("job-c")]
+
+    with patch.object(Orchestrator, "_run_single_job", side_effect=["failed", "success", "success"]):
+        report = Orchestrator(cfg, batch_id="failfast").run_batch(jobs)
+
+    assert report["failed"] == 1
+    assert report["aborted"] == 2
+    assert list(report["jobs"].keys()) == ["job-a", "job-b", "job-c"]
+    assert report["jobs"]["job-a"] == "failed"
+    assert report["jobs"]["job-b"] == "aborted_before_start"
+    assert report["jobs"]["job-c"] == "aborted_before_start"
 
 
 @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_mock_build_stage_sequence)
@@ -592,6 +629,52 @@ def test_repeated_batch_failures_emit_batch_alert(_mock_stages, tmp_path: Path) 
         if line.strip()
     ]
     assert any(alert["error_code"] == "BATCH_REPEATED_FAILURES" for alert in alerts)
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_always_fail_sequence)
+def test_alert_dispatch_failure_does_not_mask_stage_failure(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+
+    with patch("pipeline_transcriber.orchestrator.AlertManager.send", side_effect=OSError("alerts unavailable")):
+        report = Orchestrator(cfg).run_batch([make_job()])
+
+    assert report["failed"] == 1
+
+    job_dir = Path(cfg.app.work_dir) / "test-job-01"
+    state = json.loads((job_dir / "state.json").read_text())
+    report_json = json.loads((job_dir / "report.json").read_text())
+    final_json = json.loads((job_dir / "final.json").read_text())
+
+    assert state["status"] == "failed"
+    assert state["finalization_status"] == "success"
+    assert report_json["status"] == "failed"
+    assert final_json["status"] == "failed"
+
+
+@patch("pipeline_transcriber.orchestrator.Orchestrator._run_single_job", side_effect=RuntimeError("worker crashed"))
+def test_parallel_worker_crash_writes_minimal_job_contract(_mock_run_single_job, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    cfg.app.max_parallel_jobs = 2
+    jobs = [make_job("job-a"), make_job("job-b")]
+
+    report = Orchestrator(cfg).run_batch(jobs)
+    assert report["failed"] == 2
+
+    for job in jobs:
+        job_dir = Path(cfg.app.work_dir) / job.job_id
+        state = json.loads((job_dir / "state.json").read_text())
+        report_json = json.loads((job_dir / "report.json").read_text())
+        final_json = json.loads((job_dir / "final.json").read_text())
+
+        assert state["job_id"] == job.job_id
+        assert state["status"] == "failed"
+        assert state["finalization_status"] == "failed"
+        assert state["failed_stages"]["SYSTEM"]["error"] == "worker crashed"
+        assert report_json["status"] == "failed"
+        assert report_json["finalized"] is False
+        assert final_json["status"] == "failed"
+        assert final_json["finalized"] is False
+        assert final_json["job_id"] == job.job_id
 
 
 # ---------------------------------------------------------------------------

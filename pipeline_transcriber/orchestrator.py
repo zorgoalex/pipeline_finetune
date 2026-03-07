@@ -86,7 +86,9 @@ class Orchestrator:
                 except Exception as exc:  # pragma: no cover - defensive batch wrapper
                     status = "failed"
                     log.error("job_future_failed", job_id=job.job_id, error=str(exc))
-                    self.alert_manager.send(
+                    self._write_worker_crash_artifacts(job, exc, log)
+                    self._send_alert(
+                        log=log,
                         job_id=job.job_id,
                         stage="SYSTEM",
                         severity=AlertSeverity.CRITICAL,
@@ -122,7 +124,7 @@ class Orchestrator:
             job=job, config=job_config, job_dir=job_dir,
             batch_id=self.batch_id, trace_id=trace_id,
         )
-        ctx.temp_dir = Path(job_config.app.tmp_dir) / job.job_id
+        ctx.temp_dir = Path(job_config.app.tmp_dir) / self.batch_id / job.job_id
         ctx.temp_dir.mkdir(parents=True, exist_ok=True)
 
         stage_sequence = build_stage_sequence(job_config, job)
@@ -335,7 +337,8 @@ class Orchestrator:
                 alert_error_code = "MISSING_SECRET_HF_TOKEN"
                 alert_severity = AlertSeverity.CRITICAL
 
-            self.alert_manager.send(
+            self._send_alert(
+                log=log,
                 job_id=ctx.job.job_id, stage=stage_name,
                 severity=alert_severity,
                 error_code=alert_error_code,
@@ -856,20 +859,25 @@ class Orchestrator:
         }
 
     def _build_batch_report(self, jobs: list[Job]) -> dict[str, Any]:
-        ordered_results = {
-            job.job_id: self.results.get(job.job_id, "failed")
-            for job in jobs
-            if job.job_id in self.results or not self.config.app.fail_fast_batch
-        }
+        ordered_results: dict[str, str] = {}
+        for job in jobs:
+            if job.job_id in self.results:
+                ordered_results[job.job_id] = self.results[job.job_id]
+            elif self.config.app.fail_fast_batch:
+                ordered_results[job.job_id] = "aborted_before_start"
+            else:
+                ordered_results[job.job_id] = "failed"
         success = sum(1 for s in ordered_results.values() if s == "success")
         failed = sum(1 for s in ordered_results.values() if s == "failed")
         partial = sum(1 for s in ordered_results.values() if s == "partial")
+        aborted = sum(1 for s in ordered_results.values() if s == "aborted_before_start")
         return {
             "batch_id": self.batch_id,
             "total": len(jobs),
             "success": success,
             "failed": failed,
             "partial": partial,
+            "aborted": aborted,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "jobs": ordered_results,
         }
@@ -896,7 +904,8 @@ class Orchestrator:
                 current_failed_streak = 0
 
         if max_failed_streak >= 2:
-            self.alert_manager.send(
+            self._send_alert(
+                log=logger.bind(batch_id=self.batch_id),
                 job_id=f"batch:{self.batch_id}",
                 stage="BATCH",
                 severity=AlertSeverity.CRITICAL,
@@ -941,3 +950,118 @@ class Orchestrator:
             pass
         except Exception as exc:
             log.warning("job_temp_cleanup_failed", temp_dir=str(ctx.temp_dir), error=str(exc))
+
+    def _send_alert(
+        self,
+        *,
+        log: Any,
+        job_id: str,
+        stage: str,
+        severity: AlertSeverity,
+        error_code: str,
+        message: str,
+        attempts_used: int,
+        trace_id: str,
+    ) -> None:
+        try:
+            self.alert_manager.send(
+                job_id=job_id,
+                stage=stage,
+                severity=severity,
+                error_code=error_code,
+                message=message,
+                attempts_used=attempts_used,
+                trace_id=trace_id,
+            )
+        except Exception as exc:  # pragma: no cover - defensive boundary over mocked/custom managers
+            log.warning(
+                "alert_dispatch_failed",
+                alert_job_id=job_id,
+                alert_stage=stage,
+                alert_error_code=error_code,
+                error=str(exc),
+            )
+
+    def _write_worker_crash_artifacts(self, job: Job, exc: Exception, log: Any) -> None:
+        job_dir = Path(self.config.app.work_dir) / job.job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        trace_id = f"crash-{uuid.uuid4().hex[:12]}"
+        job_dict = job.model_dump(mode="json")
+        state = JobState(job.job_id, job_dir)
+        state.config_hash = JobState.compute_config_hash(
+            self.config.model_dump(mode="json"),
+        )
+        state.job_hash = JobState.compute_config_hash(job_dict)
+        state.job_snapshot = job_dict
+
+        try:
+            job_config = self.config.model_copy(deep=True)
+            stage_sequence = build_stage_sequence(job_config, job)
+            stages, finalization_stages = self._split_stage_sequence(stage_sequence)
+            state.execution_plan = [
+                stage.stage_name.value for stage in stages + finalization_stages
+            ]
+        except Exception as plan_exc:  # pragma: no cover - defensive fallback
+            log.warning("worker_crash_plan_unavailable", job_id=job.job_id, error=str(plan_exc))
+            state.execution_plan = []
+
+        state.failed_stages = {
+            "SYSTEM": {
+                "attempts": 0,
+                "error": str(exc),
+            },
+        }
+        state.stage_ledger = [StageEntry(
+            stage_name="SYSTEM",
+            status="failed",
+            attempts=0,
+            duration_ms=0,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        ).model_dump()]
+        state.finalization_status = "failed"
+        state.mark_job_finished("failed")
+
+        report_data = {
+            "job_id": job.job_id,
+            "batch_id": self.batch_id,
+            "trace_id": trace_id,
+            "status": "failed",
+            "stages": [
+                {
+                    "stage": "SYSTEM",
+                    "status": "failed",
+                    "attempts": 0,
+                    "duration_ms": 0,
+                    "error": str(exc),
+                }
+            ],
+            "total_stages": 1,
+            "finalized": False,
+            "error_type": type(exc).__name__,
+        }
+        final_data = {
+            "job_id": job.job_id,
+            "status": "failed",
+            "source": job.source,
+            "source_type": job.source_type,
+            "finalized": False,
+            "stage_ledger": report_data["stages"],
+            "execution": {
+                "outcome": {
+                    "status": "failed",
+                    "stages_executed": [],
+                    "timings_type": None,
+                    "num_speakers": None,
+                    "num_segments": 0,
+                    "artifacts_written": [],
+                    "failed_stage": "SYSTEM",
+                    "error_message": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+            },
+        }
+
+        self._atomic_write_json(job_dir / "report.json", report_data)
+        self._atomic_write_json(job_dir / "final.json", final_data)

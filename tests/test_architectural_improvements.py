@@ -371,6 +371,36 @@ class TestIndestructibleFinalization:
         assert len(final["stage_ledger"]) == 2
         assert "execution" in final
 
+    def test_finalizer_repair_of_corrupt_report_leaves_repair_warning(self, tmp_path: Path):
+        ctx = make_ctx(tmp_path)
+        ctx.stage_ledger = [StageEntry(stage_name="INPUT_VALIDATE", status="success", duration_ms=10)]
+
+        report_path = ctx.job_dir / "report.json"
+        report_path.write_text("{corrupt")
+
+        finalizer = FinalizeReportStage()
+        finalizer.run(ctx, job_status="success")
+
+        report = json.loads(report_path.read_text())
+        assert report["finalized"] is True
+        assert "repair_warnings" in report
+        assert any(item["artifact"] == "report.json" for item in report["repair_warnings"])
+
+    def test_finalizer_repair_of_corrupt_final_leaves_repair_warning(self, tmp_path: Path):
+        ctx = make_ctx(tmp_path)
+        ctx.stage_ledger = [StageEntry(stage_name="INPUT_VALIDATE", status="success", duration_ms=10)]
+
+        final_path = ctx.job_dir / "final.json"
+        final_path.write_text("{corrupt")
+
+        finalizer = FinalizeReportStage()
+        finalizer.run(ctx, job_status="success")
+
+        final_data = json.loads(final_path.read_text())
+        assert final_data["finalized"] is True
+        assert "repair_warnings" in final_data
+        assert any(item["artifact"] == "final.json" for item in final_data["repair_warnings"])
+
     def test_finalization_status_success(self, tmp_path: Path):
         """After successful finalize, state.finalization_status == 'success'."""
         job_dir = tmp_path / "fin_ok"
