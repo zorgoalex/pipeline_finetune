@@ -42,9 +42,24 @@ class VadStage(BaseStage):
         # Post-process: enforce max segment duration
         segments = self._split_long_segments(segments, vad_cfg.max_segment_sec)
 
-        # Save segments
+        # Export clips if configured
+        artifacts: list[str] = []
+        actual_clip_files = 0
+        if vad_cfg.export_clips:
+            clips_dir = vad_dir / "clips"
+            clips_dir.mkdir(parents=True, exist_ok=True)
+            clip_records = self._export_clips(ctx, segments, clips_dir)
+            segments = [
+                {**seg, "clip_id": clip["clip_id"], "clip_path": clip["clip_path"]}
+                for seg, clip in zip(segments, clip_records, strict=True)
+            ]
+            artifacts.append(str(clips_dir))
+            actual_clip_files = self._count_clip_files(clips_dir)
+
+        # Save segments after optional clip enrichment
         segments_path = vad_dir / "vad_segments.json"
         segments_path.write_text(json.dumps(segments, indent=2))
+        artifacts.insert(0, str(segments_path))
 
         # Save report
         total_speech = sum(s["end"] - s["start"] for s in segments)
@@ -55,19 +70,12 @@ class VadStage(BaseStage):
             "min_speech_duration": vad_cfg.min_speech_duration_sec,
             "min_silence_duration": vad_cfg.min_silence_duration_sec,
             "max_segment_sec": vad_cfg.max_segment_sec,
+            "export_clips": vad_cfg.export_clips,
+            "actual_clip_files": actual_clip_files,
         }
         report_path = vad_dir / "vad_report.json"
         report_path.write_text(json.dumps(report, indent=2))
-
-        # Export clips if configured
-        artifacts = [str(segments_path), str(report_path)]
-        actual_clip_files = 0
-        if vad_cfg.export_clips:
-            clips_dir = vad_dir / "clips"
-            clips_dir.mkdir(parents=True, exist_ok=True)
-            self._export_clips(ctx, segments, clips_dir)
-            artifacts.append(str(clips_dir))
-            actual_clip_files = self._count_clip_files(clips_dir)
+        artifacts.insert(1, str(report_path))
 
         ctx.vad_segments = segments
 
@@ -168,11 +176,12 @@ class VadStage(BaseStage):
                     start = end
         return result
 
-    def _export_clips(self, ctx: StageContext, segments: list[dict], clips_dir: Path) -> None:
+    def _export_clips(self, ctx: StageContext, segments: list[dict], clips_dir: Path) -> list[dict[str, Any]]:
         """Export individual WAV clips for each VAD segment using ffmpeg."""
         from pipeline_transcriber.utils.subprocess import run_command
 
         ffmpeg_path = ctx.config.ffmpeg.ffmpeg_path
+        clip_records: list[dict[str, Any]] = []
         for i, seg in enumerate(segments):
             clip_path = clips_dir / f"clip_{i:04d}.wav"
             args = [
@@ -184,6 +193,11 @@ class VadStage(BaseStage):
                 str(clip_path),
             ]
             run_command(args, check=True)
+            clip_records.append({
+                "clip_id": f"clip_{i:04d}",
+                "clip_path": str(clip_path.relative_to(ctx.job_dir)),
+            })
+        return clip_records
 
     @staticmethod
     def _count_clip_files(clips_dir: Path) -> int:

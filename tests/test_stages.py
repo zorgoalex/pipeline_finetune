@@ -221,6 +221,26 @@ class TestPreflightValidation:
         result = InputValidateStage().run(ctx)
         assert result.status == StageStatus.SUCCESS
 
+    def test_vad_clips_requires_vad_enabled(self, tmp_path):
+        ctx = self._make_ctx(tmp_path, enable_word_timestamps=False)
+        ctx.config.alignment.enabled = False
+        ctx.config.asr.mode = "vad_clips"
+        ctx.config.vad.enabled = False
+        ctx.config.vad.export_clips = True
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.FAILED
+        assert any("vad.enabled" in w for w in result.warnings)
+
+    def test_vad_clips_requires_export_clips(self, tmp_path):
+        ctx = self._make_ctx(tmp_path, enable_word_timestamps=False)
+        ctx.config.alignment.enabled = False
+        ctx.config.asr.mode = "vad_clips"
+        ctx.config.vad.enabled = True
+        ctx.config.vad.export_clips = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.FAILED
+        assert any("vad.export_clips" in w for w in result.warnings)
+
     def test_expected_speakers_min_zero_fails(self, tmp_path):
         from pipeline_transcriber.models.job import ExpectedSpeakers
         ctx = self._make_ctx(tmp_path, enable_word_timestamps=False,

@@ -111,6 +111,36 @@ class QaStage(BaseStage):
             "details": f"Found {len(neg_durations)} segments with negative duration." if not no_neg else "No negative durations.",
         })
 
+        if ctx.config.asr.mode == "vad_clips":
+            manifest = (ctx.asr_result or {}).get("clip_manifest", [])
+            manifest_present = len(manifest) > 0
+            checks.append({
+                "name": "clip_manifest_present",
+                "passed": manifest_present,
+                "details": f"Found {len(manifest)} clip manifest entries.",
+            })
+
+            actual_clip_ids = {
+                seg.get("source_clip_id")
+                for seg in segments
+                if seg.get("source_clip_id")
+            }
+            missing_clip_ids = [
+                clip["clip_id"]
+                for clip in manifest
+                if clip.get("segments_count", 0) > 0 and clip["clip_id"] not in actual_clip_ids
+            ]
+            clip_ids_accounted_for = manifest_present and len(missing_clip_ids) == 0
+            checks.append({
+                "name": "clip_ids_accounted_for",
+                "passed": clip_ids_accounted_for,
+                "details": (
+                    "All clip ids with ASR output are represented in merged segments."
+                    if clip_ids_accounted_for
+                    else f"Missing clip ids in merged segments: {missing_clip_ids}"
+                ),
+            })
+
         all_passed = all(c["passed"] for c in checks)
 
         report = {
@@ -168,7 +198,8 @@ class QaStage(BaseStage):
 
         # Hard failures: unconditional
         hard_fail_names = {"final_json_exists", "segments_non_empty",
-                           "time_intervals_valid", "no_negative_durations"}
+                           "time_intervals_valid", "no_negative_durations",
+                           "clip_manifest_present", "clip_ids_accounted_for"}
         # Flag-gated failures
         flag_gated = {
             "word_alignment_ratio": qa_cfg.fail_on_missing_word_timestamps,

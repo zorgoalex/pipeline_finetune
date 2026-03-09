@@ -49,21 +49,13 @@ class AsrStage(BaseStage):
             language=ctx.job.language if ctx.job.language != "auto" else None,
         )
 
-        log.info("asr_transcribing", audio_path=str(ctx.audio_path))
-        audio = whisperx.load_audio(str(ctx.audio_path))
-        result = model.transcribe(
-            audio,
-            batch_size=asr_config.batch_size,
-            language=ctx.job.language if ctx.job.language != "auto" else None,
-        )
+        if asr_config.mode == "vad_clips":
+            asr_result = self._transcribe_vad_clips(ctx, model, whisperx)
+        else:
+            asr_result = self._transcribe_full_audio(ctx, model, whisperx)
 
-        segments = result.get("segments", [])
-        detected_language = result.get("language", ctx.job.language)
-
-        asr_result: dict[str, Any] = {
-            "segments": segments,
-            "language": detected_language,
-        }
+        segments = asr_result.get("segments", [])
+        detected_language = asr_result.get("language", ctx.job.language)
 
         # Save raw ASR output
         raw_path = asr_dir / "raw_asr.json"
@@ -82,10 +74,14 @@ class AsrStage(BaseStage):
             "model": asr_config.model_name,
             "device": device,
             "compute_type": asr_config.compute_type,
+            "mode": asr_config.mode,
             "language_detected": detected_language,
             "num_segments": len(segments),
             "total_duration": segments[-1]["end"] if segments else 0,
         }
+        if asr_config.mode == "vad_clips":
+            report["clips_expected"] = asr_result.get("clips_expected", 0)
+            report["clips_processed"] = asr_result.get("clips_processed", 0)
         report_path.write_text(json.dumps(report, indent=2))
 
         ctx.asr_result = asr_result
@@ -99,8 +95,110 @@ class AsrStage(BaseStage):
         return StageResult(
             status=StageStatus.SUCCESS,
             artifacts=artifacts,
-            metrics={"num_segments": len(segments), "language": detected_language},
+            metrics={
+                "num_segments": len(segments),
+                "language": detected_language,
+                "mode": asr_config.mode,
+                "clips_expected": asr_result.get("clips_expected", 0),
+                "clips_processed": asr_result.get("clips_processed", 0),
+            },
         )
+
+    def _transcribe_full_audio(self, ctx: StageContext, model: Any, whisperx: Any) -> dict[str, Any]:
+        log = self._log(ctx)
+        log.info("asr_transcribing", mode="full_audio", audio_path=str(ctx.audio_path))
+        audio = whisperx.load_audio(str(ctx.audio_path))
+        result = model.transcribe(
+            audio,
+            batch_size=ctx.config.asr.batch_size,
+            language=ctx.job.language if ctx.job.language != "auto" else None,
+        )
+
+        segments = self._normalize_segment_ids(result.get("segments", []))
+        return {
+            "segments": segments,
+            "language": result.get("language", ctx.job.language),
+            "mode": "full_audio",
+        }
+
+    def _transcribe_vad_clips(self, ctx: StageContext, model: Any, whisperx: Any) -> dict[str, Any]:
+        log = self._log(ctx)
+        clip_manifest = self._resolve_clip_manifest(ctx)
+
+        merged_segments: list[dict[str, Any]] = []
+        manifest_with_stats: list[dict[str, Any]] = []
+        detected_language = ctx.job.language
+
+        for clip in clip_manifest:
+            clip_path = self._resolve_clip_path(ctx, clip)
+            log.info("asr_transcribing_clip", clip_id=clip["clip_id"], clip_path=str(clip_path))
+            audio = whisperx.load_audio(str(clip_path))
+            result = model.transcribe(
+                audio,
+                batch_size=ctx.config.asr.batch_size,
+                language=ctx.job.language if ctx.job.language != "auto" else None,
+            )
+            clip_segments = result.get("segments", [])
+            if result.get("language"):
+                detected_language = result["language"]
+
+            rebased_segments = []
+            for seg in clip_segments:
+                rebased = dict(seg)
+                rebased["start"] = round(float(rebased.get("start", 0.0)) + float(clip["start"]), 3)
+                rebased["end"] = round(float(rebased.get("end", 0.0)) + float(clip["start"]), 3)
+                rebased["source_clip_id"] = clip["clip_id"]
+                rebased_segments.append(rebased)
+
+            merged_segments.extend(rebased_segments)
+            manifest_with_stats.append({
+                "clip_id": clip["clip_id"],
+                "clip_path": clip["clip_path"],
+                "start": clip["start"],
+                "end": clip["end"],
+                "segments_count": len(rebased_segments),
+            })
+
+        merged_segments.sort(key=lambda seg: (seg.get("start", 0.0), seg.get("end", 0.0)))
+        merged_segments = self._normalize_segment_ids(merged_segments)
+
+        return {
+            "segments": merged_segments,
+            "language": detected_language,
+            "mode": "vad_clips",
+            "clips_expected": len(clip_manifest),
+            "clips_processed": len(manifest_with_stats),
+            "clip_manifest": manifest_with_stats,
+        }
+
+    @staticmethod
+    def _normalize_segment_ids(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized = []
+        for index, seg in enumerate(segments):
+            item = dict(seg)
+            item["id"] = index
+            normalized.append(item)
+        return normalized
+
+    def _resolve_clip_manifest(self, ctx: StageContext) -> list[dict[str, Any]]:
+        if not ctx.vad_segments:
+            raise RuntimeError("asr.mode=vad_clips requires VAD segments with exported clips")
+
+        manifest = [
+            seg for seg in ctx.vad_segments
+            if seg.get("clip_id") and seg.get("clip_path")
+        ]
+        if not manifest:
+            raise RuntimeError("asr.mode=vad_clips requires vad.export_clips=true and clip manifest data")
+
+        return sorted(manifest, key=lambda seg: (float(seg.get("start", 0.0)), seg["clip_id"]))
+
+    @staticmethod
+    def _resolve_clip_path(ctx: StageContext, clip: dict[str, Any]) -> Path:
+        clip_path = ctx.job_dir / clip["clip_path"]
+        if not clip_path.exists():
+            raise RuntimeError(f"VAD clip not found: {clip_path}")
+        return clip_path
 
     def _resolve_device(self, device_setting: str) -> str:
         if device_setting != "auto":
@@ -142,6 +240,33 @@ class AsrStage(BaseStage):
         )
         if not has_segments:
             all_ok = False
+
+        if ctx.config.asr.mode == "vad_clips":
+            manifest = ctx.asr_result.get("clip_manifest", []) if ctx.asr_result else []
+            manifest_present = len(manifest) > 0
+            checks.append(
+                CheckResult(
+                    name="clip_manifest_present",
+                    passed=manifest_present,
+                    details=f"Clip manifest entries: {len(manifest)}",
+                )
+            )
+            if not manifest_present:
+                all_ok = False
+
+            all_have_clip_id = all(
+                seg.get("source_clip_id")
+                for seg in ctx.asr_result.get("segments", [])
+            ) if ctx.asr_result and ctx.asr_result.get("segments") else False
+            checks.append(
+                CheckResult(
+                    name="segments_have_source_clip_id",
+                    passed=all_have_clip_id,
+                    details="All merged ASR segments carry source_clip_id.",
+                )
+            )
+            if not all_have_clip_id:
+                all_ok = False
 
         return ValidationResult(ok=all_ok, checks=checks)
 

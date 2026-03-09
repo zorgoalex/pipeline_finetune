@@ -49,6 +49,18 @@ class InputValidateStage(BaseStage):
                 warnings=["Job requests diarization but diarization is disabled in config."],
             )
 
+        if ctx.config.asr.mode == "vad_clips":
+            if not ctx.config.vad.enabled:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    warnings=["asr.mode=vad_clips requires vad.enabled=true."],
+                )
+            if not ctx.config.vad.export_clips:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    warnings=["asr.mode=vad_clips requires vad.export_clips=true."],
+                )
+
         # Validate output_formats values
         valid_formats = {"json", "srt", "vtt", "txt", "csv", "tsv"}
         if ctx.job.output_formats:
