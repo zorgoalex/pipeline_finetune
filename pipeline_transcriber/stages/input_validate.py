@@ -50,7 +50,7 @@ class InputValidateStage(BaseStage):
             )
 
         # Validate output_formats values
-        valid_formats = {"json", "srt", "vtt", "txt"}
+        valid_formats = {"json", "srt", "vtt", "txt", "csv", "tsv"}
         if ctx.job.output_formats:
             invalid = set(ctx.job.output_formats) - valid_formats
             if invalid:

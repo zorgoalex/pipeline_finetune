@@ -215,7 +215,7 @@ class TestPreflightValidation:
         assert any("mp3" in w for w in result.warnings)
 
     def test_valid_output_formats_ok(self, tmp_path):
-        ctx = self._make_ctx(tmp_path, output_formats=["json", "srt", "vtt", "txt"],
+        ctx = self._make_ctx(tmp_path, output_formats=["json", "srt", "vtt", "txt", "csv", "tsv"],
                              enable_word_timestamps=False)
         ctx.config.alignment.enabled = False
         result = InputValidateStage().run(ctx)

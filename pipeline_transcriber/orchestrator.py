@@ -340,6 +340,9 @@ class Orchestrator:
             if type(exc).__name__ == "HfTokenError":
                 alert_error_code = "MISSING_SECRET_HF_TOKEN"
                 alert_severity = AlertSeverity.CRITICAL
+            elif type(exc).__name__ == "HfAccessError":
+                alert_error_code = "HF_MODEL_ACCESS_DENIED"
+                alert_severity = AlertSeverity.CRITICAL
 
             self._send_alert(
                 log=log,

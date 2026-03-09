@@ -654,6 +654,50 @@ def _always_fail_sequence(config, job=None):
     ]
 
 
+def _diarization_access_denied_sequence(config, job=None):
+    from pipeline_transcriber.models.stage import StageName
+    from pipeline_transcriber.stages.finalize import FinalizeReportStage
+    from pipeline_transcriber.stages.input_validate import InputValidateStage
+    from pipeline_transcriber.stages.diarize import HfAccessError
+
+    class AudioReadyStage(BaseStage):
+        @property
+        def stage_name(self):
+            return StageName.AUDIO_PREPARE
+
+        def run(self, ctx: StageContext) -> StageResult:
+            audio_dir = ctx.artifacts_dir / "audio"
+            audio_dir.mkdir(parents=True, exist_ok=True)
+            audio = audio_dir / "audio_16k_mono.wav"
+            audio.write_bytes(b"\x00" * 100)
+            ctx.audio_path = audio
+            return StageResult(status=StageStatus.SUCCESS, artifacts=[str(audio)], metrics={})
+
+        def validate(self, ctx, result):
+            return ValidationResult(ok=True, checks=[])
+
+    class AccessDeniedStage(BaseStage):
+        @property
+        def stage_name(self):
+            return StageName.SPEAKER_DIARIZATION
+
+        def run(self, ctx: StageContext) -> StageResult:
+            raise HfAccessError("You must accept the conditions to access this model")
+
+        def validate(self, ctx, result):
+            return ValidationResult(ok=True, checks=[])
+
+        def can_retry(self, error, ctx):
+            return False
+
+    return [
+        InputValidateStage(),
+        AudioReadyStage(),
+        AccessDeniedStage(),
+        FinalizeReportStage(),
+    ]
+
+
 @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_diarization_missing_secret_sequence)
 def test_missing_secret_emits_specific_alert(_mock_stages, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HF_TOKEN", raising=False)
@@ -672,6 +716,25 @@ def test_missing_secret_emits_specific_alert(_mock_stages, tmp_path: Path, monke
         if line.strip()
     ]
     assert any(alert["error_code"] == "MISSING_SECRET_HF_TOKEN" for alert in alerts)
+
+
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_diarization_access_denied_sequence)
+def test_hf_access_denied_emits_specific_alert(_mock_stages, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HF_TOKEN", "hf_test_token")
+
+    cfg = make_config(tmp_path)
+    cfg.diarization.enabled = True
+    job = make_job(enable_diarization=True)
+
+    report = Orchestrator(cfg).run_batch([job])
+    assert report["failed"] == 1
+
+    alerts = [
+        json.loads(line)
+        for line in cfg.alerts.alerts_file.read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(alert["error_code"] == "HF_MODEL_ACCESS_DENIED" for alert in alerts)
 
 
 @patch("pipeline_transcriber.orchestrator.Orchestrator._run_single_job", side_effect=RuntimeError("worker crashed"))

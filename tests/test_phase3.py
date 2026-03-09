@@ -179,24 +179,61 @@ class TestVadStage:
         result = StageResult(status=StageStatus.SUCCESS, artifacts=[])
         vr = stage.validate(ctx, result)
         assert vr.ok is False
+        assert vr.retry_recommended is True
+        assert "no speech detected" in (vr.retry_reason or "")
 
     # -- suggest_fallback --
 
-    def test_suggest_fallback_attempt_2_relaxes(self, tmp_path: Path):
+    def test_suggest_fallback_relaxes_after_no_speech_request(self, tmp_path: Path):
         stage = self._stage()
         ctx = make_context(tmp_path)
+        ctx.vad_segments = []
+        stage.validate(ctx, StageResult(status=StageStatus.SUCCESS, artifacts=[]))
         orig_speech = ctx.config.vad.min_speech_duration_sec
         orig_silence = ctx.config.vad.min_silence_duration_sec
-        fb = stage.suggest_fallback(2, ctx)
+        fb = stage.suggest_fallback(1, ctx)
         assert fb == {"action": "relax_thresholds"}
         assert ctx.config.vad.min_speech_duration_sec < orig_speech
         assert ctx.config.vad.min_silence_duration_sec < orig_silence
 
-    def test_suggest_fallback_attempt_1_noop(self, tmp_path: Path):
+    def test_suggest_fallback_without_no_speech_request_is_noop(self, tmp_path: Path):
         stage = self._stage()
         ctx = make_context(tmp_path)
         fb = stage.suggest_fallback(1, ctx)
         assert fb == {}
+
+    def test_validate_passes_terminal_no_speech_after_retry(self, tmp_path: Path):
+        stage = self._stage()
+        ctx = make_context(tmp_path)
+        ctx.vad_segments = []
+        setattr(ctx, "_vad_no_speech_retry_done", True)
+
+        vr = stage.validate(ctx, StageResult(status=StageStatus.SUCCESS, artifacts=[]))
+
+        assert vr.ok is True
+        assert any(check.name == "no_speech_detected" and check.passed for check in vr.checks)
+
+    def test_validate_clip_count_mismatch_requests_retry(self, tmp_path: Path):
+        stage = self._stage()
+        ctx = make_context(tmp_path)
+        ctx.config.vad.export_clips = True
+        ctx.vad_segments = [{"start": 0.0, "end": 1.0}, {"start": 2.0, "end": 3.0}]
+
+        vad_dir = ctx.artifacts_dir / "vad"
+        clips_dir = vad_dir / "clips"
+        clips_dir.mkdir(parents=True, exist_ok=True)
+        (clips_dir / "clip_0000.wav").write_bytes(b"RIFF")
+
+        result = StageResult(
+            status=StageStatus.SUCCESS,
+            artifacts=[str(clips_dir)],
+        )
+
+        vr = stage.validate(ctx, result)
+
+        assert vr.ok is False
+        assert vr.retry_recommended is True
+        assert "generated clips" in (vr.retry_reason or "")
 
     # -- stage_name --
 
@@ -305,10 +342,25 @@ class TestDiarizeStage:
         ctx = make_context(tmp_path)
         assert stage.can_retry(HfTokenError("missing token"), ctx) is False
 
+    def test_can_retry_hf_access_error_returns_false(self, tmp_path: Path):
+        from pipeline_transcriber.stages.diarize import HfAccessError
+        stage = self._stage()
+        ctx = make_context(tmp_path)
+        assert stage.can_retry(HfAccessError("terms not accepted"), ctx) is False
+
     def test_can_retry_runtime_error_returns_true(self, tmp_path: Path):
         stage = self._stage()
         ctx = make_context(tmp_path)
         assert stage.can_retry(RuntimeError("something broke"), ctx) is True
+
+    def test_classifies_terms_error_as_deterministic_access_failure(self):
+        stage = self._stage()
+        assert stage._is_deterministic_hf_access_error(
+            "You must accept the conditions to access this model"
+        ) is True
+        assert stage._is_deterministic_hf_access_error(
+            "HTTP Error 503: Service Unavailable"
+        ) is False
 
     # -- validate --
 

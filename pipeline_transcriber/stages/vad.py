@@ -61,11 +61,13 @@ class VadStage(BaseStage):
 
         # Export clips if configured
         artifacts = [str(segments_path), str(report_path)]
+        actual_clip_files = 0
         if vad_cfg.export_clips:
             clips_dir = vad_dir / "clips"
             clips_dir.mkdir(parents=True, exist_ok=True)
             self._export_clips(ctx, segments, clips_dir)
             artifacts.append(str(clips_dir))
+            actual_clip_files = self._count_clip_files(clips_dir)
 
         ctx.vad_segments = segments
 
@@ -77,7 +79,14 @@ class VadStage(BaseStage):
         return StageResult(
             status=StageStatus.SUCCESS,
             artifacts=artifacts,
-            metrics={"num_segments": len(segments), "total_speech_sec": round(total_speech, 3)},
+            metrics={
+                "num_segments": len(segments),
+                "total_speech_sec": round(total_speech, 3),
+                "speech_detected": len(segments) > 0,
+                "expected_segments_count": len(segments),
+                "actual_segment_records": len(segments),
+                "actual_clip_files": actual_clip_files,
+            },
         )
 
     def _run_silero(self, ctx: StageContext) -> list[dict]:
@@ -176,6 +185,12 @@ class VadStage(BaseStage):
             ]
             run_command(args, check=True)
 
+    @staticmethod
+    def _count_clip_files(clips_dir: Path) -> int:
+        if not clips_dir.exists():
+            return 0
+        return len(list(clips_dir.glob("*.wav")))
+
     def _resolve_device(self, ctx: StageContext) -> str:
         device = ctx.config.asr.device
         if device != "auto":
@@ -189,6 +204,8 @@ class VadStage(BaseStage):
     def validate(self, ctx: StageContext, result: StageResult) -> ValidationResult:
         checks: list[CheckResult] = []
         all_ok = True
+        retry_recommended = False
+        retry_reason = None
 
         for artifact in result.artifacts:
             p = Path(artifact)
@@ -211,8 +228,40 @@ class VadStage(BaseStage):
                 details=f"VAD produced {len(ctx.vad_segments) if ctx.vad_segments else 0} segments.",
             )
         )
+
+        if ctx.config.vad.export_clips:
+            clips_dir = ctx.artifacts_dir / "vad" / "clips"
+            actual_clip_files = self._count_clip_files(clips_dir)
+            expected_clip_files = len(ctx.vad_segments or [])
+            clip_count_ok = actual_clip_files == expected_clip_files
+            checks.append(
+                CheckResult(
+                    name="clip_count_match",
+                    passed=clip_count_ok,
+                    details=(
+                        f"Expected {expected_clip_files} clip files, found {actual_clip_files}."
+                    ),
+                )
+            )
+            if not clip_count_ok:
+                all_ok = False
+                retry_recommended = True
+                retry_reason = "mismatch between VAD segment records and generated clips"
+
         if not has_segments:
-            all_ok = False
+            if getattr(ctx, "_vad_no_speech_retry_done", False):
+                checks.append(
+                    CheckResult(
+                        name="no_speech_detected",
+                        passed=True,
+                        details="No speech detected after relaxed-threshold retry.",
+                    )
+                )
+            else:
+                all_ok = False
+                retry_recommended = True
+                retry_reason = "no speech detected; retry with relaxed thresholds"
+                setattr(ctx, "_vad_no_speech_retry_requested", True)
 
         # Validate segment ordering and bounds
         if ctx.vad_segments:
@@ -229,12 +278,19 @@ class VadStage(BaseStage):
             if not valid_bounds:
                 all_ok = False
 
-        return ValidationResult(ok=all_ok, checks=checks)
+        return ValidationResult(
+            ok=all_ok,
+            checks=checks,
+            retry_recommended=retry_recommended,
+            retry_reason=retry_reason,
+        )
 
     def suggest_fallback(self, attempt: int, ctx: StageContext) -> dict[str, Any]:
-        """On retry, relax VAD thresholds."""
+        """On retry, relax VAD thresholds for no-speech recovery."""
         vad_cfg = ctx.config.vad
-        if attempt == 2:
+        if getattr(ctx, "_vad_no_speech_retry_requested", False):
+            setattr(ctx, "_vad_no_speech_retry_requested", False)
+            setattr(ctx, "_vad_no_speech_retry_done", True)
             vad_cfg.min_speech_duration_sec = max(0.1, vad_cfg.min_speech_duration_sec * 0.5)
             vad_cfg.min_silence_duration_sec = max(0.1, vad_cfg.min_silence_duration_sec * 0.5)
             return {"action": "relax_thresholds"}

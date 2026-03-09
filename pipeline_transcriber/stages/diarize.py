@@ -21,6 +21,11 @@ class HfTokenError(Exception):
     pass
 
 
+class HfAccessError(Exception):
+    """Raised when Hugging Face model access is deterministically denied."""
+    pass
+
+
 class DiarizeStage(BaseStage):
     @property
     def stage_name(self) -> StageName:
@@ -57,9 +62,17 @@ class DiarizeStage(BaseStage):
             override_source="job" if ctx.job.expected_speakers else "config",
         )
 
-        diar_segments, num_speakers = self._run_pyannote(
-            ctx, hf_token, device, effective_min, effective_max,
-        )
+        try:
+            diar_segments, num_speakers = self._run_pyannote(
+                ctx, hf_token, device, effective_min, effective_max,
+            )
+        except Exception as exc:
+            if self._is_deterministic_hf_access_error(str(exc)):
+                raise HfAccessError(
+                    "Hugging Face model access denied for diarization. "
+                    "Verify the token and accept the model terms."
+                ) from exc
+            raise
 
         # Save RTTM
         rttm_path = diar_dir / "diarization_raw.rttm"
@@ -207,7 +220,24 @@ class DiarizeStage(BaseStage):
             return ctx.job.expected_speakers.min, ctx.job.expected_speakers.max
         return diar_cfg.min_speakers, diar_cfg.max_speakers
 
+    @staticmethod
+    def _is_deterministic_hf_access_error(error_message: str) -> bool:
+        lowered = error_message.lower()
+        patterns = (
+            "accept the conditions",
+            "accept the user conditions",
+            "access to model",
+            "gated repo",
+            "403 client error",
+            "401 client error",
+            "repository not found",
+            "is not a valid model identifier",
+            "cannot access gated repo",
+            "authentication error",
+        )
+        return any(pattern in lowered for pattern in patterns)
+
     def can_retry(self, error: Exception | None, ctx: StageContext) -> bool:
-        if isinstance(error, HfTokenError):
+        if isinstance(error, (HfTokenError, HfAccessError)):
             return False
         return True
