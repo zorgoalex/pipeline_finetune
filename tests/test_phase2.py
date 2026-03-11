@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import hashlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -348,7 +349,15 @@ class TestIsRetryableError:
 
 
 class TestDownloadStageLocalFile:
-    def test_local_file_copy(self, tmp_path: Path) -> None:
+    @patch("pipeline_transcriber.stages.download.probe_audio")
+    def test_local_file_copy(self, mock_probe: MagicMock, tmp_path: Path) -> None:
+        mock_probe.return_value = {
+            "sample_rate": 16000,
+            "channels": 1,
+            "duration_sec": 12.5,
+            "codec": "pcm_s16le",
+            "format_name": "wav",
+        }
         ctx = _make_context(tmp_path)
         stage = DownloadStage()
         result = stage.run(ctx)
@@ -365,6 +374,10 @@ class TestDownloadStageLocalFile:
         assert meta["source_type"] == "local_file"
         assert meta["title"] == "input"  # stem of input.wav
         assert meta["ext"] == "wav"
+        assert meta["file_size_bytes"] == ctx.download_output_path.stat().st_size
+        assert meta["duration_sec"] == 12.5
+        assert meta["actual_filename"] == ctx.download_output_path.name
+        assert meta["sha256"] == hashlib.sha256(ctx.download_output_path.read_bytes()).hexdigest()
 
     def test_local_file_not_found(self, tmp_path: Path) -> None:
         ctx = _make_context(tmp_path, source="/nonexistent/file.wav")
@@ -372,7 +385,15 @@ class TestDownloadStageLocalFile:
         with pytest.raises(FileNotFoundError, match="Local file not found"):
             stage.run(ctx)
 
-    def test_validate_after_run(self, tmp_path: Path) -> None:
+    @patch("pipeline_transcriber.stages.download.probe_audio")
+    def test_validate_after_run(self, mock_probe: MagicMock, tmp_path: Path) -> None:
+        mock_probe.return_value = {
+            "sample_rate": 16000,
+            "channels": 1,
+            "duration_sec": 8.0,
+            "codec": "pcm_s16le",
+            "format_name": "wav",
+        }
         ctx = _make_context(tmp_path)
         stage = DownloadStage()
         result = stage.run(ctx)
@@ -380,6 +401,77 @@ class TestDownloadStageLocalFile:
         assert validation.ok is True
         assert validation.ok is True  # next_stage_allowed removed
         assert len(validation.checks) > 0
+
+    @patch("pipeline_transcriber.stages.download.probe_audio")
+    def test_validate_fails_when_raw_media_probe_fails(self, mock_probe: MagicMock, tmp_path: Path) -> None:
+        mock_probe.side_effect = [
+            {
+                "sample_rate": 16000,
+                "channels": 1,
+                "duration_sec": 8.0,
+                "codec": "pcm_s16le",
+                "format_name": "wav",
+            },
+            {
+                "sample_rate": 16000,
+                "channels": 1,
+                "duration_sec": 8.0,
+                "codec": "pcm_s16le",
+                "format_name": "wav",
+            },
+            RuntimeError("ffprobe failed"),
+        ]
+        ctx = _make_context(tmp_path)
+        stage = DownloadStage()
+        result = stage.run(ctx)
+
+        validation = stage.validate(ctx, result)
+
+        assert validation.ok is False
+        assert any(check.name == f"media_probe:{Path(result.artifacts[0]).name}" for check in validation.checks)
+
+
+class TestDownloadStageYoutubeMetadata:
+    @patch("pipeline_transcriber.stages.download.probe_audio")
+    @patch("pipeline_transcriber.stages.download.download_video")
+    def test_youtube_metadata_enriched_with_actual_filename_and_probe(
+        self,
+        mock_download: MagicMock,
+        mock_probe: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        downloaded = tmp_path / "output" / "test-phase2" / "artifacts" / "raw" / "abc123.webm"
+        downloaded.parent.mkdir(parents=True, exist_ok=True)
+        downloaded.write_bytes(b"\x00" * 128)
+        mock_download.return_value = (
+            downloaded,
+            {
+                "id": "abc123",
+                "title": "Video",
+                "duration_sec": 33,
+                "uploader": "Uploader",
+                "upload_date": "20250101",
+                "ext": "webm",
+                "source_url": "https://youtube.test/watch?v=abc123",
+            },
+        )
+        mock_probe.return_value = {
+            "sample_rate": 48000,
+            "channels": 2,
+            "duration_sec": 33.0,
+            "codec": "opus",
+            "format_name": "matroska,webm",
+        }
+
+        ctx = _make_context(tmp_path, source_type="youtube", source="https://youtube.test/watch?v=abc123")
+        result = DownloadStage().run(ctx)
+
+        meta = json.loads((ctx.artifacts_dir / "raw" / "source_meta.json").read_text())
+        assert result.status == StageStatus.SUCCESS
+        assert meta["source_type"] == "youtube"
+        assert meta["actual_filename"] == "abc123.webm"
+        assert meta["file_size_bytes"] == downloaded.stat().st_size
+        assert meta["duration_sec"] == 33.0
 
 
 class TestDownloadStageCanRetry:
@@ -592,6 +684,64 @@ class TestExportStageValidation:
         (ctx.job_dir / "transcript.srt").unlink()
         validation = stage.validate(ctx, result)
         assert validation.ok is False
+
+    def test_validate_fails_for_malformed_final_json(self, tmp_path: Path) -> None:
+        ctx = _make_context(tmp_path)
+        ctx.asr_result = {"segments": _segments_fixture()}
+        stage = ExportStage()
+        result = stage.run(ctx)
+
+        (ctx.job_dir / "final.json").write_text("{not-json", encoding="utf-8")
+
+        validation = stage.validate(ctx, result)
+
+        assert validation.ok is False
+        assert any(check.name == "final_json_parseable" and not check.passed for check in validation.checks)
+
+    def test_validate_fails_when_final_json_missing_required_field(self, tmp_path: Path) -> None:
+        ctx = _make_context(tmp_path)
+        ctx.asr_result = {"segments": _segments_fixture()}
+        stage = ExportStage()
+        result = stage.run(ctx)
+
+        final_path = ctx.job_dir / "final.json"
+        final_data = json.loads(final_path.read_text())
+        del final_data["pipeline"]
+        final_path.write_text(json.dumps(final_data), encoding="utf-8")
+
+        validation = stage.validate(ctx, result)
+
+        assert validation.ok is False
+        assert any(check.name == "final_json_required_fields" and not check.passed for check in validation.checks)
+
+    def test_validate_fails_for_malformed_srt_content(self, tmp_path: Path) -> None:
+        ctx = _make_context(tmp_path)
+        ctx.asr_result = {"segments": _segments_fixture()}
+        stage = ExportStage()
+        result = stage.run(ctx)
+
+        (ctx.job_dir / "transcript.srt").write_text("1\n00:00:00,000 - 00:00:02,500\nbroken\n", encoding="utf-8")
+
+        validation = stage.validate(ctx, result)
+
+        assert validation.ok is False
+        assert any(check.name == "export_format:srt:structure" and not check.passed for check in validation.checks)
+
+    def test_validate_fails_for_malformed_vtt_content(self, tmp_path: Path) -> None:
+        ctx = _make_context(tmp_path)
+        ctx.asr_result = {"segments": _segments_fixture()}
+        stage = ExportStage()
+        result = stage.run(ctx)
+
+        (ctx.job_dir / "transcript.vtt").write_text(
+            "NOTWEBVTT\n\n00:00:00.000 --> 00:00:02.500\nbroken\n",
+            encoding="utf-8",
+        )
+
+        validation = stage.validate(ctx, result)
+
+        assert validation.ok is False
+        assert any(check.name == "export_format:vtt:structure" and not check.passed for check in validation.checks)
 
 
 class TestExportStageFusedPriority:

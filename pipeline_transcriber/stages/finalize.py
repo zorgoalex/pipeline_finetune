@@ -43,7 +43,9 @@ class FinalizeReportStage(BaseStage):
         })
 
         # Incorporate QA report if available
-        qa_report = self._load_optional_json(ctx.job_dir / "qa_report.json")
+        qa_report = self._normalize_qa_report(
+            self._load_optional_json(ctx.job_dir / "qa_report.json")
+        )
         if qa_report:
             report["qa"] = qa_report
 
@@ -143,6 +145,16 @@ class FinalizeReportStage(BaseStage):
                 "skip_reason": entry.skip_reason,
             })
         return stage_summaries
+
+    @staticmethod
+    def _normalize_qa_report(qa_report: dict[str, Any]) -> dict[str, Any]:
+        if not qa_report:
+            return {}
+        normalized = dict(qa_report)
+        if "passed" not in normalized and "all_passed" in normalized:
+            normalized["passed"] = bool(normalized["all_passed"])
+        normalized.setdefault("checks", [])
+        return normalized
 
     @staticmethod
     def _build_processing_metrics(ctx: StageContext) -> dict[str, float | None]:

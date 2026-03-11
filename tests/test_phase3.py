@@ -29,7 +29,7 @@ from pipeline_transcriber.utils.rttm import parse_rttm, write_rttm
 # ---------------------------------------------------------------------------
 
 def make_context(tmp_path: Path) -> StageContext:
-    job = Job(job_id="test-01", source_type="local_file", source="/tmp/test.wav")
+    job = Job(job_id="test-01", source_type="local_file", source="/tmp/test.wav", output_formats=["json", "txt"])
     config = PipelineConfig()
     job_dir = tmp_path / "output" / job.job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -643,7 +643,26 @@ class TestQaStage:
         )
         vr = stage.validate(ctx, result)
         assert vr.ok is False
-        assert vr.retry_recommended is False
+        assert vr.retry_recommended is True
+        assert vr.retry_target_stage == StageName.ASR_TRANSCRIPTION.value
+
+    def test_run_flags_nan_and_missing_requested_formats(self, tmp_path: Path):
+        stage = self._stage()
+        ctx = make_context(tmp_path)
+        ctx.asr_result = {
+            "segments": [
+                {"start": float("nan"), "end": 1.0, "text": "oops"},
+            ],
+        }
+        (ctx.job_dir / "final.json").write_text("{}")
+
+        result = stage.run(ctx)
+        assert result.status == StageStatus.SUCCESS
+
+        report = json.loads((ctx.job_dir / "qa_report.json").read_text())
+        checks_by_name = {c["name"]: c for c in report["checks"]}
+        assert checks_by_name["no_nan_values"]["passed"] is False
+        assert checks_by_name["requested_export_formats_created"]["passed"] is False
 
     def test_can_retry_returns_false(self, tmp_path: Path):
         stage = self._stage()

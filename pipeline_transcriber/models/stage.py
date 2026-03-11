@@ -44,6 +44,7 @@ class ValidationResult(BaseModel):
     checks: list[CheckResult] = Field(default_factory=list)
     retry_recommended: bool = Field(default=False)
     retry_reason: str | None = Field(default=None)
+    retry_target_stage: str | None = Field(default=None)
 
 
 class StageResult(BaseModel):

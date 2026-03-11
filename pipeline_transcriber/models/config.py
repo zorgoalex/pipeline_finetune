@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class AppConfig(BaseModel):
@@ -22,8 +22,14 @@ class LoggingConfig(BaseModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(default="INFO")
     json_format: bool = Field(default=True, alias="json")
     log_dir: Path = Field(default=Path("./output/logs"))
-    file_rotation_mb: int = Field(default=10)
-    retention_count: int = Field(default=5)
+    file_rotation_mb: int = Field(
+        default=10,
+        validation_alias=AliasChoices("file_rotation_mb", "file_rotation"),
+    )
+    retention_count: int = Field(
+        default=5,
+        validation_alias=AliasChoices("retention_count", "retention"),
+    )
 
 
 class DownloaderConfig(BaseModel):
@@ -31,6 +37,7 @@ class DownloaderConfig(BaseModel):
     yt_dlp_path: str = Field(default="yt-dlp")
     timeout_sec: int = Field(default=600)
     format: str = Field(default="bestaudio/best")
+    retries_internal: int | None = Field(default=None)
 
 
 class FfmpegConfig(BaseModel):
@@ -60,6 +67,7 @@ class AsrConfig(BaseModel):
     batch_size: int = Field(default=16)
     language: str = Field(default="auto")
     condition_on_previous_text: bool = Field(default=False)
+    vad_inside_whisperx: bool = Field(default=False)
     mode: Literal["full_audio", "vad_clips"] = Field(default="full_audio")
 
 
@@ -73,7 +81,7 @@ class AlignmentConfig(BaseModel):
 class DiarizationConfig(BaseModel):
     enabled: bool = Field(default=True)
     backend: str = Field(default="pyannote")
-    pipeline_name: str = Field(default="pyannote/speaker-diarization-3.1")
+    pipeline_name: str = Field(default="pyannote/speaker-diarization-community-1")
     hf_token_env_var: str = Field(default="HF_TOKEN")
     min_speakers: int = Field(default=1)
     max_speakers: int = Field(default=10)

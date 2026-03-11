@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from unittest.mock import patch
 
 from pipeline_transcriber.models.config import PipelineConfig
 from pipeline_transcriber.models.job import Job
@@ -103,7 +104,15 @@ class TestStageRuns:
         result = stage.run(ctx)
         assert result.status == StageStatus.SUCCESS
 
-    def test_download_creates_artifacts(self, tmp_path):
+    @patch("pipeline_transcriber.stages.download.probe_audio")
+    def test_download_creates_artifacts(self, mock_probe, tmp_path):
+        mock_probe.return_value = {
+            "sample_rate": 16000,
+            "channels": 1,
+            "duration_sec": 1.0,
+            "codec": "pcm_s16le",
+            "format_name": "wav",
+        }
         ctx = make_context(tmp_path)
         stage = DownloadStage()
         result = stage.run(ctx)
@@ -146,7 +155,15 @@ class TestStageRuns:
 
 
 class TestStageValidation:
-    def test_validate_after_run(self, tmp_path):
+    @patch("pipeline_transcriber.stages.download.probe_audio")
+    def test_validate_after_run(self, mock_probe, tmp_path):
+        mock_probe.return_value = {
+            "sample_rate": 16000,
+            "channels": 1,
+            "duration_sec": 1.0,
+            "codec": "pcm_s16le",
+            "format_name": "wav",
+        }
         ctx = make_context(tmp_path)
         stage = DownloadStage()
         result = stage.run(ctx)
@@ -167,6 +184,7 @@ class TestPreflightValidation:
             job_id="preflight-test",
             source_type="local_file",
             source=str(source_file),
+            output_formats=["json"],
         )
         defaults.update(job_kwargs)
         job = Job(**defaults)
@@ -214,12 +232,28 @@ class TestPreflightValidation:
         assert result.status == StageStatus.FAILED
         assert any("mp3" in w for w in result.warnings)
 
+    def test_missing_output_formats_fails(self, tmp_path):
+        ctx = self._make_ctx(tmp_path, output_formats=[], enable_word_timestamps=False)
+        ctx.config.alignment.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.FAILED
+        assert any("non-empty" in w for w in result.warnings)
+
     def test_valid_output_formats_ok(self, tmp_path):
-        ctx = self._make_ctx(tmp_path, output_formats=["json", "srt", "vtt", "txt", "csv", "tsv"],
+        ctx = self._make_ctx(tmp_path, output_formats=["json", "srt", "vtt", "txt", "csv", "tsv", "rttm"],
+                             enable_diarization=True,
                              enable_word_timestamps=False)
         ctx.config.alignment.enabled = False
         result = InputValidateStage().run(ctx)
         assert result.status == StageStatus.SUCCESS
+
+    def test_rttm_requires_diarization(self, tmp_path):
+        ctx = self._make_ctx(tmp_path, output_formats=["json", "rttm"], enable_diarization=False,
+                             enable_word_timestamps=False)
+        ctx.config.alignment.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.FAILED
+        assert any("rttm" in w for w in result.warnings)
 
     def test_vad_clips_requires_vad_enabled(self, tmp_path):
         ctx = self._make_ctx(tmp_path, enable_word_timestamps=False)

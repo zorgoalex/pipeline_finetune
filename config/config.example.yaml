@@ -10,14 +10,15 @@ logging:
   level: "INFO"
   json: true
   log_dir: "./output/logs"
-  file_rotation_mb: 10
-  retention_count: 5
+  file_rotation: 10
+  retention: 5
 
 downloader:
   enabled: true
   yt_dlp_path: "yt-dlp"
   timeout_sec: 600
   format: "bestaudio/best"
+  retries_internal: null
 
 ffmpeg:
   ffmpeg_path: "ffmpeg"
@@ -44,6 +45,7 @@ asr:
   batch_size: 16
   language: "auto"
   condition_on_previous_text: false
+  vad_inside_whisperx: false
   mode: "full_audio"
 
 alignment:
@@ -55,7 +57,7 @@ alignment:
 diarization:
   enabled: true
   backend: "pyannote"
-  pipeline_name: "pyannote/speaker-diarization-3.1"
+  pipeline_name: "pyannote/speaker-diarization-community-1"
   hf_token_env_var: "HF_TOKEN"
   min_speakers: 1
   max_speakers: 10

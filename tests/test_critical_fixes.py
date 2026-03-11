@@ -223,7 +223,8 @@ class TestQaGatekeeper:
 
         validation = stage.validate(ctx, result)
         assert validation.ok is False
-        assert validation.retry_recommended is False
+        assert validation.retry_recommended is True
+        assert validation.retry_target_stage == StageName.ASR_TRANSCRIPTION.value
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +306,7 @@ class TestFinalizePatching:
         report = json.loads((job_dir / "report.json").read_text())
         assert "qa" in report
         assert report["qa"]["all_passed"] is True
+        assert report["qa"]["passed"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -34,7 +34,10 @@ class InputValidateStage(BaseStage):
             )
 
         if not ctx.job.output_formats:
-            warnings.append("No output_formats specified; defaults will be used.")
+            return StageResult(
+                status=StageStatus.FAILED,
+                warnings=["output_formats must be a non-empty list."],
+            )
 
         # Strict preflight: job requesting capability disabled by config → FAIL
         if ctx.job.enable_word_timestamps and not ctx.config.alignment.enabled:
@@ -62,14 +65,19 @@ class InputValidateStage(BaseStage):
                 )
 
         # Validate output_formats values
-        valid_formats = {"json", "srt", "vtt", "txt", "csv", "tsv"}
-        if ctx.job.output_formats:
-            invalid = set(ctx.job.output_formats) - valid_formats
-            if invalid:
-                return StageResult(
-                    status=StageStatus.FAILED,
-                    warnings=[f"Invalid output_formats: {sorted(invalid)}. Valid: {sorted(valid_formats)}"],
-                )
+        valid_formats = {"json", "srt", "vtt", "txt", "csv", "tsv", "rttm"}
+        invalid = set(ctx.job.output_formats) - valid_formats
+        if invalid:
+            return StageResult(
+                status=StageStatus.FAILED,
+                warnings=[f"Invalid output_formats: {sorted(invalid)}. Valid: {sorted(valid_formats)}"],
+            )
+
+        if "rttm" in ctx.job.output_formats and not ctx.job.enable_diarization:
+            return StageResult(
+                status=StageStatus.FAILED,
+                warnings=["output_formats includes 'rttm' but enable_diarization=false."],
+            )
 
         # Validate expected_speakers bounds
         if ctx.job.expected_speakers is not None:

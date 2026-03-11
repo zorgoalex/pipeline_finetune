@@ -23,6 +23,7 @@ class StageContext:
     stage_outputs: dict[str, StageResult] = field(default_factory=dict)
     stage_ledger: list[StageEntry] = field(default_factory=list)
     execution_plan: ExecutionPlan | None = None
+    qa_reruns: dict[str, int] = field(default_factory=dict)
     # Typed inter-stage data
     download_output_path: Path | None = None
     audio_path: Path | None = None

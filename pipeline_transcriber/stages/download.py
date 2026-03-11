@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -12,6 +13,7 @@ from pipeline_transcriber.models.stage import (
     ValidationResult,
 )
 from pipeline_transcriber.stages.base import BaseStage, StageContext
+from pipeline_transcriber.utils.ffmpeg import probe_audio
 from pipeline_transcriber.utils.yt_dlp import (
     DownloadError,
     download_video,
@@ -35,6 +37,8 @@ class DownloadStage(BaseStage):
             media_path, meta = self._download_youtube(ctx, raw_dir)
         else:
             media_path, meta = self._copy_local(ctx, raw_dir)
+
+        meta = self._enrich_media_metadata(ctx, media_path, meta)
 
         meta_path = raw_dir / "source_meta.json"
         meta_path.write_text(json.dumps(meta, indent=2))
@@ -68,15 +72,35 @@ class DownloadStage(BaseStage):
 
         dest = raw_dir / source.name
         shutil.copy2(source, dest)
-
+        probe = probe_audio(dest, ffprobe_path=ctx.config.ffmpeg.ffprobe_path)
         meta = {
             "source": str(source),
             "source_type": "local_file",
             "title": source.stem,
-            "duration_sec": None,
+            "duration_sec": probe["duration_sec"],
             "ext": source.suffix.lstrip("."),
         }
         return dest, meta
+
+    def _enrich_media_metadata(self, ctx: StageContext, media_path: Path, meta: dict) -> dict:
+        probe = probe_audio(media_path, ffprobe_path=ctx.config.ffmpeg.ffprobe_path)
+        enriched = dict(meta)
+        enriched.update({
+            "actual_filename": media_path.name,
+            "file_size_bytes": media_path.stat().st_size,
+            "sha256": self._compute_sha256(media_path),
+            "duration_sec": probe["duration_sec"],
+            "probe": probe,
+        })
+        return enriched
+
+    @staticmethod
+    def _compute_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def validate(self, ctx: StageContext, result: StageResult) -> ValidationResult:
         checks: list[CheckResult] = []
@@ -102,6 +126,27 @@ class DownloadStage(BaseStage):
                     )
                 )
                 if not non_empty:
+                    all_ok = False
+                try:
+                    probe = probe_audio(p, ffprobe_path=ctx.config.ffmpeg.ffprobe_path)
+                    probe_ok = float(probe["duration_sec"]) > 0
+                    checks.append(
+                        CheckResult(
+                            name=f"media_probe:{p.name}",
+                            passed=probe_ok,
+                            details=f"duration_sec={probe['duration_sec']}",
+                        )
+                    )
+                    if not probe_ok:
+                        all_ok = False
+                except Exception as exc:
+                    checks.append(
+                        CheckResult(
+                            name=f"media_probe:{p.name}",
+                            passed=False,
+                            details=str(exc),
+                        )
+                    )
                     all_ok = False
             if not exists:
                 all_ok = False

@@ -17,6 +17,24 @@ from pipeline_transcriber.utils.timecode import seconds_to_srt, seconds_to_vtt
 
 
 class ExportStage(BaseStage):
+    _FINAL_JSON_REQUIRED_FIELDS = {
+        "job_id",
+        "status",
+        "source",
+        "source_type",
+        "language",
+        "model",
+        "device",
+        "timings_type",
+        "diarization_enabled",
+        "audio",
+        "speakers",
+        "segments",
+        "metrics",
+        "artifacts",
+        "pipeline",
+    }
+
     @property
     def stage_name(self) -> StageName:
         return StageName.EXPORTER
@@ -212,6 +230,8 @@ class ExportStage(BaseStage):
     def validate(self, ctx: StageContext, result: StageResult) -> ValidationResult:
         checks: list[CheckResult] = []
         all_ok = True
+        source = ctx.fused_result or ctx.aligned_result or ctx.asr_result or {"segments": []}
+        expected_segments = source.get("segments", [])
 
         # final.json is mandatory (always written)
         final_path = ctx.job_dir / "final.json"
@@ -223,14 +243,21 @@ class ExportStage(BaseStage):
         ))
         if not final_exists:
             all_ok = False
+        else:
+            final_ok, final_checks = self._validate_final_json_contract(final_path)
+            checks.extend(final_checks)
+            if not final_ok:
+                all_ok = False
 
         # Check requested export formats
         format_map = {
+            "json": "final.json",
             "csv": "transcript.csv",
             "tsv": "transcript.tsv",
             "txt": "transcript.txt",
             "srt": "transcript.srt",
             "vtt": "transcript.vtt",
+            "rttm": "diarization.rttm",
         }
         requested = (
             ctx.job.output_formats if ctx.job.output_formats
@@ -251,5 +278,162 @@ class ExportStage(BaseStage):
             )
             if not exists:
                 all_ok = False
+                continue
+
+            if fmt == "srt":
+                srt_ok, details = self._validate_srt_file(fpath, expected_count=len(expected_segments))
+                checks.append(CheckResult(
+                    name="export_format:srt:structure",
+                    passed=srt_ok,
+                    details=details,
+                ))
+                if not srt_ok:
+                    all_ok = False
+            elif fmt == "vtt":
+                vtt_ok, details = self._validate_vtt_file(fpath, expected_count=len(expected_segments))
+                checks.append(CheckResult(
+                    name="export_format:vtt:structure",
+                    passed=vtt_ok,
+                    details=details,
+                ))
+                if not vtt_ok:
+                    all_ok = False
 
         return ValidationResult(ok=all_ok, checks=checks)
+
+    def _validate_final_json_contract(self, final_path: Path) -> tuple[bool, list[CheckResult]]:
+        checks: list[CheckResult] = []
+        try:
+            final_data = json.loads(final_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            return False, [
+                CheckResult(
+                    name="final_json_parseable",
+                    passed=False,
+                    details=f"invalid JSON: {exc}",
+                )
+            ]
+
+        checks.append(CheckResult(
+            name="final_json_parseable",
+            passed=True,
+            details="valid JSON",
+        ))
+
+        missing_fields = sorted(self._FINAL_JSON_REQUIRED_FIELDS - set(final_data.keys()))
+        required_fields_ok = not missing_fields
+        checks.append(CheckResult(
+            name="final_json_required_fields",
+            passed=required_fields_ok,
+            details="all required fields present" if required_fields_ok else f"missing={missing_fields}",
+        ))
+
+        nested_ok = True
+        nested_errors: list[str] = []
+        if not isinstance(final_data.get("segments"), list):
+            nested_ok = False
+            nested_errors.append("segments must be a list")
+        if not isinstance(final_data.get("artifacts"), dict):
+            nested_ok = False
+            nested_errors.append("artifacts must be an object")
+        if not isinstance(final_data.get("speakers"), list):
+            nested_ok = False
+            nested_errors.append("speakers must be a list")
+        if not isinstance(final_data.get("audio"), dict):
+            nested_ok = False
+            nested_errors.append("audio must be an object")
+        if not isinstance(final_data.get("metrics"), dict):
+            nested_ok = False
+            nested_errors.append("metrics must be an object")
+
+        pipeline = final_data.get("pipeline")
+        if not isinstance(pipeline, dict):
+            nested_ok = False
+            nested_errors.append("pipeline must be an object")
+        else:
+            if "version" not in pipeline:
+                nested_ok = False
+                nested_errors.append("pipeline.version missing")
+            if "config_snapshot" not in pipeline:
+                nested_ok = False
+                nested_errors.append("pipeline.config_snapshot missing")
+
+        checks.append(CheckResult(
+            name="final_json_schema_shape",
+            passed=nested_ok,
+            details="schema shape ok" if nested_ok else "; ".join(nested_errors),
+        ))
+
+        return required_fields_ok and nested_ok, checks
+
+    def _validate_srt_file(self, path: Path, expected_count: int) -> tuple[bool, str]:
+        text = path.read_text(encoding="utf-8")
+        blocks = [block.splitlines() for block in text.strip().split("\n\n") if block.strip()]
+
+        if expected_count == 0:
+            if blocks:
+                return False, f"expected 0 cues, found {len(blocks)}"
+            return True, "empty SRT accepted for 0 segments"
+
+        if len(blocks) != expected_count:
+            return False, f"expected {expected_count} cues, found {len(blocks)}"
+
+        prev_end = -1.0
+        for index, lines in enumerate(blocks, 1):
+            if len(lines) < 3:
+                return False, f"cue {index} has fewer than 3 lines"
+            if lines[0].strip() != str(index):
+                return False, f"cue {index} index mismatch: {lines[0]!r}"
+            ok, start, end, details = self._parse_time_range(lines[1], decimal_separator=",")
+            if not ok:
+                return False, f"cue {index} invalid timecode: {details}"
+            if start > end:
+                return False, f"cue {index} start > end"
+            if start < prev_end:
+                return False, f"cue {index} overlaps previous cue"
+            prev_end = end
+
+        return True, f"{len(blocks)} cues validated"
+
+    def _validate_vtt_file(self, path: Path, expected_count: int) -> tuple[bool, str]:
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        if not lines or lines[0].strip() != "WEBVTT":
+            return False, "missing WEBVTT header"
+
+        cue_lines = [line for line in lines[1:] if " --> " in line]
+        if len(cue_lines) != expected_count:
+            return False, f"expected {expected_count} cues, found {len(cue_lines)}"
+
+        prev_end = -1.0
+        for index, line in enumerate(cue_lines, 1):
+            ok, start, end, details = self._parse_time_range(line, decimal_separator=".")
+            if not ok:
+                return False, f"cue {index} invalid timecode: {details}"
+            if start > end:
+                return False, f"cue {index} start > end"
+            if start < prev_end:
+                return False, f"cue {index} overlaps previous cue"
+            prev_end = end
+
+        return True, f"{len(cue_lines)} cues validated"
+
+    @staticmethod
+    def _parse_time_range(line: str, decimal_separator: str) -> tuple[bool, float, float, str]:
+        parts = [part.strip() for part in line.split(" --> ")]
+        if len(parts) != 2:
+            return False, 0.0, 0.0, "missing separator"
+        try:
+            start = ExportStage._parse_timestamp(parts[0], decimal_separator=decimal_separator)
+            end = ExportStage._parse_timestamp(parts[1], decimal_separator=decimal_separator)
+        except ValueError as exc:
+            return False, 0.0, 0.0, str(exc)
+        return True, start, end, "ok"
+
+    @staticmethod
+    def _parse_timestamp(value: str, decimal_separator: str) -> float:
+        normalized = value.strip()
+        hh_mm_ss, millis = normalized.rsplit(decimal_separator, 1)
+        hours, minutes, seconds = hh_mm_ss.split(":")
+        total = (int(hours) * 3600) + (int(minutes) * 60) + int(seconds)
+        return total + (int(millis) / 1000.0)

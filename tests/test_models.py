@@ -57,6 +57,14 @@ class TestPipelineConfig:
         lc2 = LoggingConfig(json=False)
         assert lc2.json_format is False
 
+    def test_config_spec_aliases_are_accepted(self) -> None:
+        cfg = load_config(ROOT / "config" / "config.example.yaml")
+        assert cfg.logging.file_rotation_mb == 10
+        assert cfg.logging.retention_count == 5
+        assert cfg.downloader.retries_internal is None
+        assert cfg.asr.vad_inside_whisperx is False
+        assert cfg.diarization.pipeline_name == "pyannote/speaker-diarization-community-1"
+
     def test_config_invalid_level(self) -> None:
         with pytest.raises(ValidationError):
             LoggingConfig(level="INVALID")
@@ -205,6 +213,7 @@ class TestStageResult:
         assert len(vr.checks) == 1
         assert vr.checks[0].passed is True
         assert vr.retry_recommended is False
+        assert vr.retry_target_stage is None
 
     def test_stage_name_enum(self) -> None:
         assert len(StageName) == 11

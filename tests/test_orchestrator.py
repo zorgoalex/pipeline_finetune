@@ -300,6 +300,60 @@ def _validation_failure_sequence(config, job=None):
     ]
 
 
+def _qa_backtrack_sequence(config, job=None):
+    from pipeline_transcriber.models.stage import StageName
+    from pipeline_transcriber.stages.input_validate import InputValidateStage
+    from pipeline_transcriber.stages.qa import QaStage
+    from pipeline_transcriber.stages.finalize import FinalizeReportStage
+
+    class MockAsrStage(BaseStage):
+        @property
+        def stage_name(self):
+            return StageName.ASR_TRANSCRIPTION
+
+        def run(self, ctx: StageContext) -> StageResult:
+            ctx.asr_result = {
+                "segments": [
+                    {"id": 0, "start": 0.0, "end": 2.0, "text": "hello"},
+                ],
+                "language": "en",
+            }
+            return StageResult(status=StageStatus.SUCCESS, artifacts=[])
+
+        def validate(self, ctx, result):
+            return ValidationResult(ok=True, checks=[])
+
+    class FlakyExporterStage(BaseStage):
+        def __init__(self):
+            self.calls = 0
+
+        @property
+        def stage_name(self):
+            return StageName.EXPORTER
+
+        def run(self, ctx: StageContext) -> StageResult:
+            self.calls += 1
+            final_path = ctx.job_dir / "final.json"
+            final_path.write_text(json.dumps({"job_id": ctx.job.job_id, "segments": ctx.asr_result["segments"]}))
+            artifacts = [str(final_path)]
+            if self.calls >= 2:
+                txt_path = ctx.job_dir / "transcript.txt"
+                txt_path.write_text("hello\n")
+                artifacts.append(str(txt_path))
+            return StageResult(status=StageStatus.SUCCESS, artifacts=artifacts)
+
+        def validate(self, ctx, result):
+            return ValidationResult(ok=True, checks=[])
+
+    return [
+        InputValidateStage(),
+        MockAsrStage(),
+        FlakyExporterStage(),
+        QaStage(),
+        FinalizeReportStage(),
+    ]
+
+
 @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_validation_failure_sequence)
 def test_stage_feedback_failure_contract_includes_retry_reason(_mock_stages, tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
@@ -321,6 +375,27 @@ def test_stage_feedback_failure_contract_includes_retry_reason(_mock_stages, tmp
     assert feedback["actual"]["checks"][0]["passed"] is False
 
 
+@patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_qa_backtrack_sequence)
+def test_qa_backtrack_reruns_localized_stage(_mock_stages, tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    orch = Orchestrator(cfg)
+    job = make_job()
+
+    report = orch.run_batch([job])
+    assert report["success"] == 1
+
+    job_dir = Path(cfg.app.work_dir) / job.job_id
+    assert (job_dir / "transcript.txt").exists()
+
+    state = json.loads((job_dir / "state.json").read_text())
+    exporter_entries = [e for e in state["stage_ledger"] if e["stage_name"] == "EXPORTER"]
+    qa_entries = [e for e in state["stage_ledger"] if e["stage_name"] == "QA_VALIDATOR"]
+    assert len(exporter_entries) == 2
+    assert len(qa_entries) == 2
+    assert qa_entries[0]["status"] == "failed"
+    assert qa_entries[1]["status"] == "success"
+
+
 def _sleep_stage_sequence(config, job=None):
     from pipeline_transcriber.models.stage import StageName
     from pipeline_transcriber.stages.input_validate import InputValidateStage
@@ -332,7 +407,7 @@ def _sleep_stage_sequence(config, job=None):
             return StageName.DOWNLOAD
 
         def run(self, ctx: StageContext) -> StageResult:
-            time.sleep(0.3)
+            time.sleep(0.5)
             return StageResult(status=StageStatus.SUCCESS, artifacts=[], metrics={})
 
         def validate(self, ctx, result):
@@ -445,7 +520,7 @@ def test_parallel_batch_execution_is_faster_than_sequential(_mock_stages, tmp_pa
     Orchestrator(cfg_par).run_batch(jobs)
     parallel_duration = time.monotonic() - t1
 
-    assert sequential_duration > 0.5
+    assert sequential_duration > 0.9
     assert parallel_duration < sequential_duration * 0.8
 
 

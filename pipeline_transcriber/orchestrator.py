@@ -207,18 +207,38 @@ class Orchestrator:
         restored_stages = {e.stage_name for e in ctx.stage_ledger}
 
         try:
-            for stage in stages:
+            stage_index = 0
+            while stage_index < len(stages):
+                stage = stages[stage_index]
                 if resume and self._resume_skip_stage(
                     stage.stage_name.value, state, restored_stages, ctx, log,
                 ):
+                    stage_index += 1
                     continue
 
                 stage_result = self._run_stage(stage, ctx, state, log)
+                if stage_result.startswith("rerun:"):
+                    target_stage = stage_result.split(":", 1)[1]
+                    rerun_index = self._schedule_qa_rerun(
+                        target_stage=target_stage,
+                        stages=stages,
+                        failed_stage_index=stage_index,
+                        ctx=ctx,
+                        state=state,
+                        log=log,
+                    )
+                    if rerun_index is None:
+                        break
+                    stage_index = rerun_index
+                    continue
+
                 if stage_result == "failed":
                     if self._is_optional_stage(stage, job):
                         log.warning("optional_stage_failed", stage=stage.stage_name.value)
+                        stage_index += 1
                         continue
                     break
+                stage_index += 1
         finally:
             # Guaranteed finalization: always compute base status, write safety-net,
             # then run finalization stages as their own lifecycle.
@@ -343,16 +363,6 @@ class Orchestrator:
             elif type(exc).__name__ == "HfAccessError":
                 alert_error_code = "HF_MODEL_ACCESS_DENIED"
                 alert_severity = AlertSeverity.CRITICAL
-
-            self._send_alert(
-                log=log,
-                job_id=ctx.job.job_id, stage=stage_name,
-                severity=alert_severity,
-                error_code=alert_error_code,
-                message=error_msg,
-                attempts_used=attempts_used,
-                trace_id=ctx.trace_id,
-            )
             # Extract validation checks from StageValidationError if available
             validation_checks = None
             validation = None
@@ -362,11 +372,37 @@ class Orchestrator:
                     {"name": c.name, "passed": c.passed, "details": c.details}
                     for c in exc.validation.checks
                 ]
+            qa_rerun_target = None
+            if (
+                stage_name == "QA_VALIDATOR"
+                and validation is not None
+                and validation.retry_recommended
+                and validation.retry_target_stage
+            ):
+                qa_rerun_target = validation.retry_target_stage
+            if qa_rerun_target is None:
+                self._send_alert(
+                    log=log,
+                    job_id=ctx.job.job_id, stage=stage_name,
+                    severity=alert_severity,
+                    error_code=alert_error_code,
+                    message=error_msg,
+                    attempts_used=attempts_used,
+                    trace_id=ctx.trace_id,
+                )
             self._write_stage_feedback(
                 ctx, stage_name, None, attempts_used,
                 False, validation_checks, validation=validation,
                 error_message=error_msg,
             )
+            if qa_rerun_target is not None:
+                log.warning(
+                    "qa_retry_backtrack_requested",
+                    stage=stage_name,
+                    target_stage=qa_rerun_target,
+                    reason=validation.retry_reason,
+                )
+                return f"rerun:{qa_rerun_target}"
             return "failed"
 
     @staticmethod
@@ -426,6 +462,11 @@ class Orchestrator:
             "retry_reason": (
                 validation.retry_reason
                 if validation is not None and hasattr(validation, "retry_reason")
+                else None
+            ),
+            "retry_target_stage": (
+                validation.retry_target_stage
+                if validation is not None and hasattr(validation, "retry_target_stage")
                 else None
             ),
             "checks": checks,
@@ -517,6 +558,106 @@ class Orchestrator:
             ))
         log.info("stage_skipped_resume", stage=stage_name)
         return True
+
+    def _schedule_qa_rerun(
+        self,
+        *,
+        target_stage: str,
+        stages: list[BaseStage],
+        failed_stage_index: int,
+        ctx: StageContext,
+        state: JobState,
+        log: Any,
+    ) -> int | None:
+        target_index = next(
+            (
+                index
+                for index, stage in enumerate(stages)
+                if stage.stage_name.value == target_stage
+            ),
+            None,
+        )
+        if target_index is None or target_index > failed_stage_index:
+            log.error("qa_rerun_target_invalid", target_stage=target_stage)
+            return None
+
+        rerun_count = ctx.qa_reruns.get(target_stage, 0)
+        if rerun_count >= 1:
+            log.error("qa_rerun_limit_reached", target_stage=target_stage)
+            return None
+        ctx.qa_reruns[target_stage] = rerun_count + 1
+
+        invalidated_stage_names = [stage.stage_name.value for stage in stages[target_index:]]
+        state.completed_stages = [
+            stage_name
+            for stage_name in state.completed_stages
+            if stage_name not in invalidated_stage_names
+        ]
+        for stage_name in invalidated_stage_names:
+            state.stage_attempts.pop(stage_name, None)
+            state.failed_stages.pop(stage_name, None)
+            ctx.stage_outputs.pop(stage_name, None)
+        self._clear_ctx_stage_data(invalidated_stage_names, ctx)
+        state._save()
+
+        log.warning(
+            "qa_rerun_scheduled",
+            target_stage=target_stage,
+            invalidated_stages=invalidated_stage_names,
+            rerun_count=ctx.qa_reruns[target_stage],
+        )
+        return target_index
+
+    @staticmethod
+    def _clear_ctx_stage_data(invalidated_stage_names: list[str], ctx: StageContext) -> None:
+        attr_map = {
+            "DOWNLOAD": (
+                "download_output_path",
+                "audio_path",
+                "vad_segments",
+                "asr_result",
+                "aligned_result",
+                "diarization_result",
+                "fused_result",
+            ),
+            "AUDIO_PREPARE": (
+                "audio_path",
+                "vad_segments",
+                "asr_result",
+                "aligned_result",
+                "diarization_result",
+                "fused_result",
+            ),
+            "VAD_SEGMENTATION": (
+                "vad_segments",
+                "asr_result",
+                "aligned_result",
+                "diarization_result",
+                "fused_result",
+            ),
+            "ASR_TRANSCRIPTION": (
+                "asr_result",
+                "aligned_result",
+                "diarization_result",
+                "fused_result",
+            ),
+            "ALIGNMENT": (
+                "aligned_result",
+                "fused_result",
+            ),
+            "SPEAKER_DIARIZATION": (
+                "diarization_result",
+                "fused_result",
+            ),
+            "SPEAKER_ASSIGNMENT": ("fused_result",),
+        }
+        attrs_to_clear = {
+            attr
+            for stage_name in invalidated_stage_names
+            for attr in attr_map.get(stage_name, ())
+        }
+        for attr in attrs_to_clear:
+            setattr(ctx, attr, None)
 
     def _compute_main_job_status(self, ledger: list[StageEntry], job: Job) -> str:
         latest_entries = self._latest_stage_entries(ledger)
