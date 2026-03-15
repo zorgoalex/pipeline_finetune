@@ -124,10 +124,20 @@ class DiarizeStage(BaseStage):
 
         diar_cfg = ctx.config.diarization
 
-        diarize_model = whisperx.DiarizationPipeline(
+        # whisperx 3.8+ moved DiarizationPipeline to whisperx.diarize
+        DiarizationPipeline = getattr(
+            whisperx, "DiarizationPipeline", None
+        )
+        if DiarizationPipeline is None:
+            from whisperx.diarize import DiarizationPipeline
+        # whisperx 3.8+ uses 'token' instead of 'use_auth_token'
+        import inspect
+        init_params = inspect.signature(DiarizationPipeline.__init__).parameters
+        auth_kwarg = "token" if "token" in init_params else "use_auth_token"
+        diarize_model = DiarizationPipeline(
             model_name=diar_cfg.pipeline_name,
-            use_auth_token=hf_token,
             device=device,
+            **{auth_kwarg: hf_token},
         )
 
         diarize_kwargs: dict[str, Any] = {}
