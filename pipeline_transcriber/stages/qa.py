@@ -58,8 +58,16 @@ class QaStage(BaseStage):
             and len(ctx.vad_segments) == 0
             and getattr(ctx, "_vad_no_speech_retry_done", False)
         )
+        # vad_clips mode: all clips may produce 0 ASR segments (noise/silence)
+        all_clips_silent = False
+        if ctx.config.asr.mode == "vad_clips":
+            manifest = (ctx.asr_result or {}).get("clip_manifest", [])
+            all_clips_silent = (
+                len(manifest) > 0
+                and all(clip.get("segments_count", 0) == 0 for clip in manifest)
+            )
         has_segments = len(segments) > 0
-        segments_check_passed = has_segments or vad_no_speech
+        segments_check_passed = has_segments or vad_no_speech or all_clips_silent
         checks.append({
             "name": "segments_non_empty",
             "passed": segments_check_passed,
@@ -80,7 +88,7 @@ class QaStage(BaseStage):
             if isinstance(seg.get("start", 0.0), (int, float))
             and isinstance(seg.get("end", 0.0), (int, float))
         )
-        coverage_positive = total_coverage_sec > 0.0 if segments else False
+        coverage_positive = total_coverage_sec > 0.0 if segments else (vad_no_speech or all_clips_silent)
         checks.append({
             "name": "coverage_positive",
             "passed": coverage_positive,
@@ -239,9 +247,11 @@ class QaStage(BaseStage):
                     ),
                 })
 
+            # Use asr_result directly — alignment/fusion strips source_clip_id
+            asr_segments = (ctx.asr_result or {}).get("segments", [])
             actual_clip_ids = {
                 seg.get("source_clip_id")
-                for seg in segments
+                for seg in asr_segments
                 if seg.get("source_clip_id")
             }
             missing_clip_ids = [

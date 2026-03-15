@@ -216,7 +216,7 @@ class TestStageResult:
         assert vr.retry_target_stage is None
 
     def test_stage_name_enum(self) -> None:
-        assert len(StageName) == 11
+        assert len(StageName) == 12
         assert StageName.INPUT_VALIDATE.value == "INPUT_VALIDATE"
         assert StageName.FINALIZE_REPORT.value == "FINALIZE_REPORT"
 

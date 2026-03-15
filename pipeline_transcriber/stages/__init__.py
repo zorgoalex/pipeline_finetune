@@ -11,6 +11,7 @@ from pipeline_transcriber.stages.download import DownloadStage
 from pipeline_transcriber.stages.audio_prepare import AudioPrepareStage
 from pipeline_transcriber.stages.vad import VadStage
 from pipeline_transcriber.stages.asr import AsrStage
+from pipeline_transcriber.stages.post_process import PostProcessStage
 from pipeline_transcriber.stages.align import AlignStage
 from pipeline_transcriber.stages.diarize import DiarizeStage
 from pipeline_transcriber.stages.assign_speakers import AssignSpeakersStage
@@ -30,6 +31,9 @@ def build_stage_sequence(config: PipelineConfig, job: Job | None = None) -> list
     if config.vad.enabled:
         stages.append(VadStage())
     stages.append(AsrStage())
+
+    if config.post_process.enabled:
+        stages.append(PostProcessStage())
 
     # Alignment: requires both config enabled AND job requesting word timestamps
     want_alignment = config.alignment.enabled

@@ -72,6 +72,15 @@ class AsrConfig(BaseModel):
     condition_on_previous_text: bool = Field(default=False)
     vad_inside_whisperx: bool = Field(default=False)
     mode: Literal["full_audio", "vad_clips"] = Field(default="full_audio")
+    n_mels: int | None = Field(default=None)
+
+
+class PostProcessConfig(BaseModel):
+    enabled: bool = Field(default=False)
+    capitalize_sentences: bool = Field(default=True)
+    add_terminal_punctuation: bool = Field(default=True)
+    filter_repetitive_ngrams: bool = Field(default=True)
+    max_consecutive_repeats: int = Field(default=3)
 
 
 class AlignmentConfig(BaseModel):
@@ -121,6 +130,7 @@ class PipelineConfig(BaseModel):
     ffmpeg: FfmpegConfig = Field(default_factory=FfmpegConfig)
     vad: VadConfig = Field(default_factory=VadConfig)
     asr: AsrConfig = Field(default_factory=AsrConfig)
+    post_process: PostProcessConfig = Field(default_factory=PostProcessConfig)
     alignment: AlignmentConfig = Field(default_factory=AlignmentConfig)
     diarization: DiarizationConfig = Field(default_factory=DiarizationConfig)
     export: ExportConfig = Field(default_factory=ExportConfig)

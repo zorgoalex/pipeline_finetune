@@ -51,7 +51,13 @@ class AsrStage(BaseStage):
             language=ctx.job.language if ctx.job.language != "auto" else None,
         )
         model_load_ms = round((time.monotonic() - t0_load) * 1000)
-        log.info("asr_model_loaded", model_load_time_ms=model_load_ms)
+
+        # Support 128 mel bins for large-v3-turbo models (config override or auto-detect)
+        if asr_config.n_mels is not None:
+            if hasattr(model, "feat_kwargs"):
+                model.feat_kwargs["feature_size"] = asr_config.n_mels
+        detected_mels = getattr(model, "feat_kwargs", {}).get("feature_size", 80)
+        log.info("asr_model_loaded", model_load_time_ms=model_load_ms, n_mels=detected_mels)
 
         t0_infer = time.monotonic()
         if asr_config.mode == "vad_clips":
