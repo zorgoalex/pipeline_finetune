@@ -270,13 +270,13 @@ class AsrStage(BaseStage):
 
         return ValidationResult(ok=all_ok, checks=checks)
 
-    def suggest_fallback(self, attempt: int, ctx: StageContext) -> dict[str, Any]:
+    def suggest_fallback(self, attempt_no: int, ctx: StageContext) -> dict[str, Any]:
         """On retry, try smaller model or lower batch size."""
         asr_cfg = ctx.config.asr
-        if attempt == 2 and asr_cfg.batch_size > 4:
+        if attempt_no == 2 and asr_cfg.batch_size > 4:
             asr_cfg.batch_size = max(4, asr_cfg.batch_size // 2)
             return {"action": "reduce_batch_size", "new_batch_size": asr_cfg.batch_size}
-        if attempt >= 3 and asr_cfg.model_name != "tiny":
+        if attempt_no >= 3 and asr_cfg.model_name != "tiny":
             model_fallback = {"large-v3": "medium", "medium": "small", "small": "base", "base": "tiny"}
             new_model = model_fallback.get(asr_cfg.model_name, "tiny")
             asr_cfg.model_name = new_model

@@ -191,7 +191,8 @@ class FinalizeReportStage(BaseStage):
         final_data["stage_ledger"] = stage_summaries
         final_data["finalized"] = True
         final_data["execution"] = execution_contract
-        final_data["qa"] = qa_report
+        if qa_report and isinstance(qa_report, dict):
+            final_data["qa"] = qa_report
         final_metrics = final_data.setdefault("metrics", {})
         if isinstance(final_metrics, dict):
             final_metrics.update(metrics)

@@ -52,7 +52,7 @@ class BaseStage(ABC):
     def can_retry(self, error: Exception | None, ctx: StageContext) -> bool:
         return True
 
-    def suggest_fallback(self, attempt: int, ctx: StageContext) -> dict[str, Any]:
+    def suggest_fallback(self, attempt_no: int, ctx: StageContext) -> dict[str, Any]:
         return {}
 
     def cleanup_temp(self, ctx: StageContext) -> None:

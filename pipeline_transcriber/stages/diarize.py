@@ -197,6 +197,23 @@ class DiarizeStage(BaseStage):
             if not has_segments:
                 all_ok = False
 
+            # Validate interval validity: start <= end for all segments
+            if diar_segs:
+                intervals_valid = all(
+                    s.get("start", 0) <= s.get("end", 0) for s in diar_segs
+                )
+                checks.append(
+                    CheckResult(
+                        name="diarization_intervals_valid",
+                        passed=intervals_valid,
+                        details="All diarization intervals have start <= end."
+                        if intervals_valid
+                        else "Some diarization intervals have start > end.",
+                    )
+                )
+                if not intervals_valid:
+                    all_ok = False
+
             # Check speaker count within effective bounds
             eff_min, eff_max = self._effective_speaker_bounds(ctx)
             speakers_ok = eff_min <= num_speakers <= eff_max
@@ -210,6 +227,21 @@ class DiarizeStage(BaseStage):
             # Speaker count out of range is a warning, not a failure
             if not speakers_ok:
                 pass  # informational only
+
+        # Validate RTTM file is non-empty
+        rttm_path = ctx.artifacts_dir / "diarization" / "diarization_raw.rttm"
+        if rttm_path.exists():
+            rttm_non_empty = rttm_path.stat().st_size > 0
+            checks.append(
+                CheckResult(
+                    name="rttm_non_empty",
+                    passed=rttm_non_empty,
+                    details="RTTM file is non-empty." if rttm_non_empty
+                    else "RTTM file exists but is empty.",
+                )
+            )
+            if not rttm_non_empty:
+                all_ok = False
 
         return ValidationResult(ok=all_ok, checks=checks)
 

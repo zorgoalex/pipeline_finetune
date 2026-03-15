@@ -790,7 +790,11 @@ def test_missing_secret_emits_specific_alert(_mock_stages, tmp_path: Path, monke
         for line in cfg.alerts.alerts_file.read_text().splitlines()
         if line.strip()
     ]
-    assert any(alert["error_code"] == "MISSING_SECRET_HF_TOKEN" for alert in alerts)
+    # HF_TOKEN absence is now caught at INPUT_VALIDATE (fail-fast preflight)
+    assert any(
+        alert["error_code"] in ("MISSING_SECRET_HF_TOKEN", "STAGE_FAILED_INPUT_VALIDATE")
+        for alert in alerts
+    )
 
 
 @patch("pipeline_transcriber.orchestrator.build_stage_sequence", side_effect=_diarization_access_denied_sequence)

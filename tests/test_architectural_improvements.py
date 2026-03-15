@@ -475,7 +475,7 @@ class TestIndestructibleFinalization:
             def can_retry(self, error, ctx):
                 return True
 
-            def suggest_fallback(self, attempt, ctx):
+            def suggest_fallback(self, attempt_no, ctx):
                 return {}
 
         def _legacy_build(config, job=None):
@@ -510,7 +510,7 @@ class TestIndestructibleFinalization:
             def can_retry(self, error, ctx):
                 return True
 
-            def suggest_fallback(self, attempt, ctx):
+            def suggest_fallback(self, attempt_no, ctx):
                 return {}
 
         def _legacy_build(config, job=None):

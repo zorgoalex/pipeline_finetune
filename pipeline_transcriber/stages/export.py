@@ -33,6 +33,7 @@ class ExportStage(BaseStage):
         "metrics",
         "artifacts",
         "pipeline",
+        "qa",
     }
 
     @property
@@ -197,8 +198,14 @@ class ExportStage(BaseStage):
             "segments": segments,
             "metrics": {
                 "num_segments": len(segments),
+                "processing_time_sec": None,
+                "rtf": None,
             },
             "artifacts": self._discover_artifacts(ctx),
+            "qa": {
+                "passed": None,
+                "checks": [],
+            },
             "pipeline": {
                 "version": "0.1.0",
                 "config_snapshot": self._build_config_snapshot(ctx),
@@ -345,6 +352,18 @@ class ExportStage(BaseStage):
         if not isinstance(final_data.get("metrics"), dict):
             nested_ok = False
             nested_errors.append("metrics must be an object")
+
+        qa = final_data.get("qa")
+        if not isinstance(qa, dict):
+            nested_ok = False
+            nested_errors.append("qa must be an object")
+        else:
+            if "passed" not in qa:
+                nested_ok = False
+                nested_errors.append("qa.passed missing")
+            if "checks" not in qa:
+                nested_ok = False
+                nested_errors.append("qa.checks missing")
 
         pipeline = final_data.get("pipeline")
         if not isinstance(pipeline, dict):

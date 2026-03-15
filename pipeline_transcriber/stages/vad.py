@@ -292,6 +292,25 @@ class VadStage(BaseStage):
             if not valid_bounds:
                 all_ok = False
 
+            # Overlap check: segments must not overlap when overlap mode is off
+            sorted_segs = sorted(ctx.vad_segments, key=lambda s: s["start"])
+            has_overlap = False
+            for i in range(1, len(sorted_segs)):
+                if sorted_segs[i]["start"] < sorted_segs[i - 1]["end"]:
+                    has_overlap = True
+                    break
+            no_overlap_ok = not has_overlap
+            checks.append(
+                CheckResult(
+                    name="no_segment_overlap",
+                    passed=no_overlap_ok,
+                    details="No overlapping segments." if no_overlap_ok
+                    else f"Overlap detected between segment {i - 1} and {i}.",
+                )
+            )
+            if not no_overlap_ok:
+                all_ok = False
+
         return ValidationResult(
             ok=all_ok,
             checks=checks,
@@ -299,7 +318,7 @@ class VadStage(BaseStage):
             retry_reason=retry_reason,
         )
 
-    def suggest_fallback(self, attempt: int, ctx: StageContext) -> dict[str, Any]:
+    def suggest_fallback(self, attempt_no: int, ctx: StageContext) -> dict[str, Any]:
         """On retry, relax VAD thresholds for no-speech recovery."""
         vad_cfg = ctx.config.vad
         if getattr(ctx, "_vad_no_speech_retry_requested", False):

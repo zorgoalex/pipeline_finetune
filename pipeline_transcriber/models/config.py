@@ -19,7 +19,7 @@ class AppConfig(BaseModel):
 class LoggingConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
-    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(default="INFO")
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(default="INFO")
     json_format: bool = Field(default=True, alias="json")
     log_dir: Path = Field(default=Path("./output/logs"))
     file_rotation_mb: int = Field(

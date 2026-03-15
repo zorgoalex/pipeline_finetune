@@ -378,7 +378,7 @@ class TestDiarizeStage:
         diar_dir = ctx.artifacts_dir / "diarization"
         diar_dir.mkdir(parents=True, exist_ok=True)
         f1 = diar_dir / "diarization_raw.rttm"
-        f1.write_text("")
+        f1.write_text("SPEAKER audio1 1 0.00 1.00 <NA> <NA> SPEAKER_00 <NA> <NA>\n")
         f2 = diar_dir / "diarization_segments.json"
         f2.write_text("[]")
         f3 = diar_dir / "diarization_report.json"

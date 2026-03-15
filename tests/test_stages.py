@@ -216,7 +216,8 @@ class TestPreflightValidation:
         assert result.status == StageStatus.FAILED
         assert any("diarization" in w for w in result.warnings)
 
-    def test_diarization_with_config_ok(self, tmp_path):
+    def test_diarization_with_config_ok(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "test-token")
         ctx = self._make_ctx(tmp_path, enable_diarization=True,
                              enable_word_timestamps=False)
         ctx.config.diarization.enabled = True
@@ -239,7 +240,8 @@ class TestPreflightValidation:
         assert result.status == StageStatus.FAILED
         assert any("non-empty" in w for w in result.warnings)
 
-    def test_valid_output_formats_ok(self, tmp_path):
+    def test_valid_output_formats_ok(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "test-token")
         ctx = self._make_ctx(tmp_path, output_formats=["json", "srt", "vtt", "txt", "csv", "tsv", "rttm"],
                              enable_diarization=True,
                              enable_word_timestamps=False)
@@ -292,6 +294,25 @@ class TestPreflightValidation:
         result = InputValidateStage().run(ctx)
         assert result.status == StageStatus.FAILED
         assert any("max" in w for w in result.warnings)
+
+    def test_diarization_without_hf_token_fails(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        ctx = self._make_ctx(tmp_path, enable_diarization=True,
+                             enable_word_timestamps=False)
+        ctx.config.diarization.enabled = True
+        ctx.config.alignment.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.FAILED
+        assert any("HF_TOKEN" in w for w in result.warnings)
+
+    def test_diarization_with_hf_token_ok(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HF_TOKEN", "test-token")
+        ctx = self._make_ctx(tmp_path, enable_diarization=True,
+                             enable_word_timestamps=False)
+        ctx.config.diarization.enabled = True
+        ctx.config.alignment.enabled = False
+        result = InputValidateStage().run(ctx)
+        assert result.status == StageStatus.SUCCESS
 
 
 # ---------------------------------------------------------------------------

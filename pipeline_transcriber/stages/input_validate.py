@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from pipeline_transcriber.models.stage import (
     CheckResult,
     StageName,
@@ -78,6 +80,18 @@ class InputValidateStage(BaseStage):
                 status=StageStatus.FAILED,
                 warnings=["output_formats includes 'rttm' but enable_diarization=false."],
             )
+
+        # Fail-fast: HF_TOKEN required when diarization is enabled
+        if ctx.job.enable_diarization:
+            hf_env_var = ctx.config.diarization.hf_token_env_var
+            if not os.environ.get(hf_env_var):
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    warnings=[
+                        f"Job requests diarization but {hf_env_var} is not set. "
+                        "Set the environment variable or disable diarization."
+                    ],
+                )
 
         # Validate expected_speakers bounds
         if ctx.job.expected_speakers is not None:

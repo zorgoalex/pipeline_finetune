@@ -186,11 +186,50 @@ class AlignStage(BaseStage):
                 if not ratio_ok:
                     all_ok = False
 
+                # Check that at least one segment has non-empty words
+                any_words = any(s.get("words") for s in segments)
+                checks.append(
+                    CheckResult(
+                        name="words_not_all_empty",
+                        passed=any_words or not ctx.config.alignment.require_word_alignment,
+                        details="At least one segment has word-level data."
+                        if any_words
+                        else "All segments have empty words lists.",
+                    )
+                )
+                if not any_words and ctx.config.alignment.require_word_alignment:
+                    all_ok = False
+
+                # Check word timestamps are within segment bounds (with epsilon)
+                epsilon = 0.5  # seconds tolerance
+                word_bounds_violations = 0
+                for seg in segments:
+                    seg_start = seg.get("start", 0)
+                    seg_end = seg.get("end", 0)
+                    for w in seg.get("words", []):
+                        w_start = w.get("start")
+                        w_end = w.get("end")
+                        if w_start is not None and w_end is not None:
+                            if w_start < seg_start - epsilon or w_end > seg_end + epsilon:
+                                word_bounds_violations += 1
+                word_bounds_ok = word_bounds_violations == 0
+                checks.append(
+                    CheckResult(
+                        name="word_bounds_within_segment",
+                        passed=word_bounds_ok,
+                        details=f"All words within segment bounds (epsilon={epsilon}s)."
+                        if word_bounds_ok
+                        else f"{word_bounds_violations} words outside segment bounds.",
+                    )
+                )
+                if not word_bounds_ok:
+                    all_ok = False
+
         return ValidationResult(ok=all_ok, checks=checks)
 
-    def suggest_fallback(self, attempt: int, ctx: StageContext) -> dict[str, Any]:
+    def suggest_fallback(self, attempt_no: int, ctx: StageContext) -> dict[str, Any]:
         """On later retries, allow fallback to segment-level timestamps."""
-        if attempt >= 3:
+        if attempt_no >= 3:
             ctx.config.alignment.allow_fallback_skip = True
             return {"action": "enable_fallback_skip"}
         return {}
