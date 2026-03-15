@@ -302,18 +302,24 @@ class TestAlignStage:
 
     # -- suggest_fallback --
 
-    def test_suggest_fallback_enables_skip_on_attempt_3(self, tmp_path: Path):
+    def test_suggest_fallback_enables_skip_on_attempt_4(self, tmp_path: Path):
         stage = self._stage()
         ctx = make_context(tmp_path)
         ctx.config.alignment.allow_fallback_skip = False
-        fb = stage.suggest_fallback(3, ctx)
+        fb = stage.suggest_fallback(4, ctx)
         assert fb == {"action": "enable_fallback_skip"}
         assert ctx.config.alignment.allow_fallback_skip is True
 
-    def test_suggest_fallback_noop_before_attempt_3(self, tmp_path: Path):
+    def test_suggest_fallback_reduce_scope_on_attempt_3(self, tmp_path: Path):
         stage = self._stage()
         ctx = make_context(tmp_path)
-        fb = stage.suggest_fallback(2, ctx)
+        fb = stage.suggest_fallback(3, ctx)
+        assert fb == {"action": "reduce_alignment_scope"}
+
+    def test_suggest_fallback_noop_on_attempt_1(self, tmp_path: Path):
+        stage = self._stage()
+        ctx = make_context(tmp_path)
+        fb = stage.suggest_fallback(1, ctx)
         assert fb == {}
 
     # -- stage_name --

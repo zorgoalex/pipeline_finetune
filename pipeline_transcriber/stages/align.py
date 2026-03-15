@@ -228,8 +228,24 @@ class AlignStage(BaseStage):
         return ValidationResult(ok=all_ok, checks=checks)
 
     def suggest_fallback(self, attempt_no: int, ctx: StageContext) -> dict[str, Any]:
-        """On later retries, allow fallback to segment-level timestamps."""
-        if attempt_no >= 3:
-            ctx.config.alignment.allow_fallback_skip = True
+        """Progressive retry degradation per spec section 5.7:
+        1. same config (attempt 1, no changes)
+        2. try alternate align model if overrides available
+        3. reduce alignment scope
+        4. fallback skip alignment (if allowed)
+        """
+        align_cfg = ctx.config.alignment
+        if attempt_no == 2:
+            # Try alternate align model from overrides if available
+            lang = (ctx.asr_result or {}).get("language", "")
+            overrides = align_cfg.align_model_overrides
+            if lang and lang in overrides:
+                return {"action": "use_override_model", "model": overrides[lang]}
+            return {}
+        if attempt_no == 3:
+            # Reduce scope: disable char-level alignment by relaxing threshold
+            return {"action": "reduce_alignment_scope"}
+        if attempt_no >= 4:
+            align_cfg.allow_fallback_skip = True
             return {"action": "enable_fallback_skip"}
         return {}

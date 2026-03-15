@@ -192,7 +192,7 @@ class AssignSpeakersStage(BaseStage):
             if not no_loss:
                 all_ok = False
 
-            # Speaker assignment ratio
+            # Segment speaker assignment ratio
             if fused_segs:
                 assigned = sum(1 for s in fused_segs if s.get("speaker", "UNKNOWN") != "UNKNOWN")
                 ratio = assigned / len(fused_segs)
@@ -202,10 +202,30 @@ class AssignSpeakersStage(BaseStage):
                     CheckResult(
                         name="speaker_assignment_ratio",
                         passed=ratio_ok,
-                        details=f"Assignment ratio {ratio:.2f} vs threshold {threshold:.2f}",
+                        details=f"Segment assignment ratio {ratio:.2f} vs threshold {threshold:.2f}",
                     )
                 )
                 if not ratio_ok:
+                    all_ok = False
+
+            # Word speaker assignment ratio (spec section 5.9)
+            all_words = [w for s in fused_segs for w in s.get("words", [])]
+            if all_words:
+                words_assigned = sum(
+                    1 for w in all_words
+                    if w.get("speaker", "UNKNOWN") != "UNKNOWN"
+                )
+                word_ratio = words_assigned / len(all_words)
+                word_threshold = ctx.config.qa.min_speaker_assigned_ratio
+                word_ratio_ok = word_ratio >= word_threshold
+                checks.append(
+                    CheckResult(
+                        name="word_speaker_assignment_ratio",
+                        passed=word_ratio_ok,
+                        details=f"Word assignment ratio {word_ratio:.2f} vs threshold {word_threshold:.2f}",
+                    )
+                )
+                if not word_ratio_ok:
                     all_ok = False
 
         return ValidationResult(ok=all_ok, checks=checks)
