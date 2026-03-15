@@ -30,3 +30,7 @@ packages = ["pipeline_transcriber"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+addopts = "-m 'not e2e'"
+markers = [
+    "e2e: real end-to-end tests requiring ffmpeg, whisperx, pyannote (skipped by default)",
+]

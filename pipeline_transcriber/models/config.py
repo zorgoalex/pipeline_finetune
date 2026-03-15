@@ -57,6 +57,8 @@ class VadConfig(BaseModel):
     max_segment_sec: float = Field(default=15.0)
     padding_sec: float = Field(default=0.15)
     export_clips: bool = Field(default=False)
+    whisperx_vad_onset: float = Field(default=0.5)
+    whisperx_vad_offset: float = Field(default=0.363)
 
 
 class AsrConfig(BaseModel):

@@ -151,8 +151,8 @@ class VadStage(BaseStage):
         result = whisperx.vad.merge_vad(
             vad_model,
             audio,
-            vad_onset=0.5,
-            vad_offset=0.363,
+            vad_onset=ctx.config.vad.whisperx_vad_onset,
+            vad_offset=ctx.config.vad.whisperx_vad_offset,
         )
         segments = []
         for seg in result:

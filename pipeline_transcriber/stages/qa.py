@@ -52,13 +52,26 @@ class QaStage(BaseStage):
             "details": f"{final_path} exists={final_exists}",
         })
 
+        # Spec 5.11: segments > 0 only when speech was detected
+        vad_no_speech = (
+            ctx.vad_segments is not None
+            and len(ctx.vad_segments) == 0
+            and getattr(ctx, "_vad_no_speech_retry_done", False)
+        )
         has_segments = len(segments) > 0
+        segments_check_passed = has_segments or vad_no_speech
         checks.append({
             "name": "segments_non_empty",
-            "passed": has_segments,
-            "details": f"Found {len(segments)} segments.",
+            "passed": segments_check_passed,
+            "details": (
+                f"Found {len(segments)} segments."
+                if has_segments
+                else "No speech detected by VAD; zero segments expected."
+                if vad_no_speech
+                else f"Found {len(segments)} segments."
+            ),
         })
-        if not has_segments:
+        if not segments_check_passed:
             warnings.append("No segments found in transcript result.")
 
         total_coverage_sec = sum(
