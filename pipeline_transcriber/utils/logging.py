@@ -41,10 +41,38 @@ class _BatchIdFilter(logging.Filter):
 
 
 def _add_process_info(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
-    """Add host and pid to every log event."""
+    """Add host, pid, thread, and spec-mandated default fields to every log event."""
     event_dict["host"] = socket.gethostname()
     event_dict["pid"] = os.getpid()
     event_dict["thread"] = threading.current_thread().name
+    # Spec section 8.2: mandatory fields with safe defaults
+    event_dict.setdefault("event", event_dict.get("event", method_name))
+    event_dict.setdefault("duration_ms", None)
+    event_dict.setdefault("attempt", None)
+    return event_dict
+
+
+def _extract_exception_fields(
+    logger: Any, method_name: str, event_dict: dict[str, Any],
+) -> dict[str, Any]:
+    """Extract exception info into discrete fields per spec section 8.3."""
+    exc_info = event_dict.get("exc_info")
+    if exc_info and exc_info is not True:
+        if isinstance(exc_info, tuple) and len(exc_info) == 3:
+            exc_type, exc_value, exc_tb = exc_info
+        elif isinstance(exc_info, BaseException):
+            exc_type = type(exc_info)
+            exc_value = exc_info
+        else:
+            return event_dict
+        event_dict.setdefault("exception_type", exc_type.__name__ if exc_type else None)
+        event_dict.setdefault("exception_message", str(exc_value) if exc_value else None)
+        import traceback
+        if hasattr(exc_value, "__traceback__") and exc_value.__traceback__:
+            event_dict.setdefault(
+                "stacktrace",
+                "".join(traceback.format_exception(exc_type, exc_value, exc_value.__traceback__)),
+            )
     return event_dict
 
 
@@ -70,6 +98,7 @@ def setup_logging(
         structlog.processors.StackInfoRenderer(),
         structlog.processors.UnicodeDecoder(),
         _add_process_info,
+        _extract_exception_fields,
         mask_secrets,
     ]
 

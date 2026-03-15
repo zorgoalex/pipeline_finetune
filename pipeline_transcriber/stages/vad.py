@@ -63,10 +63,25 @@ class VadStage(BaseStage):
 
         # Save report
         total_speech = sum(s["end"] - s["start"] for s in segments)
+
+        # Get backend version and compute speech/total ratio
+        backend_version = self._get_backend_version(backend)
+        audio_duration = None
+        speech_ratio = None
+        probe_path = ctx.artifacts_dir / "audio" / "audio_probe.json"
+        if probe_path.exists():
+            import json as _json
+            audio_duration = _json.loads(probe_path.read_text()).get("duration_sec")
+            if audio_duration and audio_duration > 0:
+                speech_ratio = round(total_speech / audio_duration, 4)
+
         report = {
             "backend": backend,
+            "backend_version": backend_version,
             "num_segments": len(segments),
             "total_speech_sec": round(total_speech, 3),
+            "audio_duration_sec": audio_duration,
+            "speech_ratio": speech_ratio,
             "min_speech_duration": vad_cfg.min_speech_duration_sec,
             "min_silence_duration": vad_cfg.min_silence_duration_sec,
             "max_segment_sec": vad_cfg.max_segment_sec,
@@ -204,6 +219,19 @@ class VadStage(BaseStage):
         if not clips_dir.exists():
             return 0
         return len(list(clips_dir.glob("*.wav")))
+
+    @staticmethod
+    def _get_backend_version(backend: str) -> str | None:
+        """Try to get the backend library version."""
+        try:
+            from importlib.metadata import version
+            if backend == "silero":
+                return version("torch")
+            elif backend == "whisperx":
+                return version("whisperx")
+        except Exception:
+            pass
+        return None
 
     def _resolve_device(self, ctx: StageContext) -> str:
         device = ctx.config.asr.device

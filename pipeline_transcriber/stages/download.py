@@ -52,7 +52,11 @@ class DownloadStage(BaseStage):
     def _download_youtube(
         self, ctx: StageContext, raw_dir: Path
     ) -> tuple[Path, dict]:
+        import time
+
+        log = self._log(ctx)
         dl_config = ctx.config.downloader
+        t0 = time.monotonic()
         downloaded_path, meta = download_video(
             url=ctx.job.source,
             output_dir=raw_dir,
@@ -60,7 +64,14 @@ class DownloadStage(BaseStage):
             yt_dlp_path=dl_config.yt_dlp_path,
             timeout=dl_config.timeout_sec,
         )
+        download_ms = round((time.monotonic() - t0) * 1000)
         meta["source_type"] = "youtube"
+        file_size = downloaded_path.stat().st_size if downloaded_path.exists() else 0
+        log.info(
+            "download_youtube_complete",
+            duration_ms=download_ms,
+            file_size_bytes=file_size,
+        )
         return downloaded_path, meta
 
     def _copy_local(

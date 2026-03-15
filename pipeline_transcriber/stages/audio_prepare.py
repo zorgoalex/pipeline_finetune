@@ -29,9 +29,13 @@ class AudioPrepareStage(BaseStage):
         audio_dir = ctx.artifacts_dir / "audio"
         audio_dir.mkdir(parents=True, exist_ok=True)
 
+        import time
+
         ffmpeg_cfg = ctx.config.ffmpeg
         audio_path = audio_dir / "audio_16k_mono.wav"
 
+        input_size = ctx.download_output_path.stat().st_size if ctx.download_output_path.exists() else 0
+        t0 = time.monotonic()
         extract_audio(
             input_path=ctx.download_output_path,
             output_path=audio_path,
@@ -39,6 +43,14 @@ class AudioPrepareStage(BaseStage):
             channels=ffmpeg_cfg.audio_channels,
             ffmpeg_path=ffmpeg_cfg.ffmpeg_path,
             normalize=ffmpeg_cfg.normalize_audio,
+        )
+        elapsed_ms = round((time.monotonic() - t0) * 1000)
+        output_size = audio_path.stat().st_size if audio_path.exists() else 0
+        log.info(
+            "audio_extract_complete",
+            duration_ms=elapsed_ms,
+            input_size_bytes=input_size,
+            output_size_bytes=output_size,
         )
 
         probe = probe_audio(audio_path, ffprobe_path=ffmpeg_cfg.ffprobe_path)

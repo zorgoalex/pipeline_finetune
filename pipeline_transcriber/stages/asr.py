@@ -40,19 +40,25 @@ class AsrStage(BaseStage):
             compute_type=asr_config.compute_type,
         )
 
+        import time
         import whisperx
 
+        t0_load = time.monotonic()
         model = whisperx.load_model(
             asr_config.model_name,
             device=device,
             compute_type=asr_config.compute_type,
             language=ctx.job.language if ctx.job.language != "auto" else None,
         )
+        model_load_ms = round((time.monotonic() - t0_load) * 1000)
+        log.info("asr_model_loaded", model_load_time_ms=model_load_ms)
 
+        t0_infer = time.monotonic()
         if asr_config.mode == "vad_clips":
             asr_result = self._transcribe_vad_clips(ctx, model, whisperx)
         else:
             asr_result = self._transcribe_full_audio(ctx, model, whisperx)
+        inference_ms = round((time.monotonic() - t0_infer) * 1000)
 
         segments = asr_result.get("segments", [])
         detected_language = asr_result.get("language", ctx.job.language)
@@ -69,15 +75,22 @@ class AsrStage(BaseStage):
 
         # Save report
         report_path = asr_dir / "asr_report.json"
+        audio_duration = segments[-1]["end"] if segments else 0
+        inference_sec = inference_ms / 1000.0
+        rtf = round(inference_sec / audio_duration, 4) if audio_duration > 0 else None
         report = {
             "engine": asr_config.engine,
             "model": asr_config.model_name,
             "device": device,
             "compute_type": asr_config.compute_type,
+            "batch_size": asr_config.batch_size,
             "mode": asr_config.mode,
             "language_detected": detected_language,
             "num_segments": len(segments),
-            "total_duration": segments[-1]["end"] if segments else 0,
+            "total_duration": audio_duration,
+            "model_load_time_ms": model_load_ms,
+            "inference_time_ms": inference_ms,
+            "rtf": rtf,
         }
         if asr_config.mode == "vad_clips":
             report["clips_expected"] = asr_result.get("clips_expected", 0)
