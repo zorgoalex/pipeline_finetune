@@ -54,6 +54,18 @@ class Orchestrator:
 
             log.info("batch_started", total_jobs=len(jobs))
 
+            # C6: Batch-level input validation summary (spec 5.2)
+            # Advisory: logs summary but does not filter jobs — actual validation
+            # happens per-job inside the pipeline via InputValidateStage.
+            valid_jobs, invalid_summary = self._preflight_validate_jobs(jobs, log)
+            if invalid_summary:
+                log.warning(
+                    "batch_preflight_validation",
+                    valid_count=len(valid_jobs),
+                    invalid_count=len(invalid_summary),
+                    rejection_reasons=invalid_summary,
+                )
+
             if self.config.app.max_parallel_jobs <= 1 or self.config.app.fail_fast_batch or len(jobs) <= 1:
                 self._run_batch_sequential(jobs, resume, log)
             else:
@@ -363,6 +375,15 @@ class Orchestrator:
             elif type(exc).__name__ == "HfAccessError":
                 alert_error_code = "HF_MODEL_ACCESS_DENIED"
                 alert_severity = AlertSeverity.CRITICAL
+            elif stage_name == "EXPORTER" and isinstance(exc, StageValidationError):
+                # Detect export schema defects (spec 5.12)
+                schema_checks = {"final_json_schema_shape", "final_json_required_fields"}
+                if exc.validation and any(
+                    not c.passed and c.name in schema_checks
+                    for c in exc.validation.checks
+                ):
+                    alert_error_code = "CODE_DEFECT_EXPORT_SCHEMA"
+                    alert_severity = AlertSeverity.CRITICAL
             # Extract validation checks from StageValidationError if available
             validation_checks = None
             validation = None
@@ -1005,6 +1026,47 @@ class Orchestrator:
             "segments": segments,
             "num_speakers": len(speakers_seen),
         }
+
+    def _preflight_validate_jobs(
+        self, jobs: list[Job], log: Any,
+    ) -> tuple[list[Job], list[dict[str, Any]]]:
+        """Run lightweight input validation on all jobs before execution.
+
+        Returns (valid_jobs, invalid_summary) where invalid_summary is a list
+        of {job_id, reasons} dicts for jobs that failed preflight.
+        """
+        from pipeline_transcriber.stages.input_validate import InputValidateStage
+
+        valid_jobs: list[Job] = []
+        invalid_summary: list[dict[str, Any]] = []
+        stage = InputValidateStage()
+
+        for job in jobs:
+            job_dir = self.config.app.work_dir / job.job_id
+            job_dir.mkdir(parents=True, exist_ok=True)
+            ctx = StageContext(
+                job=job,
+                config=self.config.model_copy(deep=True),
+                job_dir=job_dir,
+                batch_id=self.batch_id,
+                trace_id="preflight",
+            )
+            try:
+                result = stage.run(ctx)
+                if result.status == StageStatus.SUCCESS:
+                    valid_jobs.append(job)
+                else:
+                    invalid_summary.append({
+                        "job_id": job.job_id,
+                        "reasons": result.warnings,
+                    })
+            except Exception as exc:
+                invalid_summary.append({
+                    "job_id": job.job_id,
+                    "reasons": [str(exc)],
+                })
+
+        return valid_jobs, invalid_summary
 
     def _build_batch_report(self, jobs: list[Job]) -> dict[str, Any]:
         ordered_results: dict[str, str] = {}

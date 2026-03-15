@@ -23,6 +23,18 @@ class InputValidateStage(BaseStage):
 
         warnings: list[str] = []
 
+        # Validate job_id format
+        if not ctx.job.job_id or not ctx.job.job_id.strip():
+            return StageResult(
+                status=StageStatus.FAILED,
+                warnings=["job_id must be a non-empty string."],
+            )
+        if any(c in ctx.job.job_id for c in ("/", "\\", "\0")):
+            return StageResult(
+                status=StageStatus.FAILED,
+                warnings=[f"job_id contains invalid characters: {ctx.job.job_id!r}"],
+            )
+
         if not ctx.job.source:
             return StageResult(
                 status=StageStatus.FAILED,
