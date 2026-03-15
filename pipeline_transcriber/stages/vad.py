@@ -264,6 +264,8 @@ class VadStage(BaseStage):
 
         if not has_segments:
             if getattr(ctx, "_vad_no_speech_retry_done", False):
+                # Terminal NO_SPEECH_DETECTED: valid outcome, not an error
+                all_ok = True
                 checks.append(
                     CheckResult(
                         name="no_speech_detected",

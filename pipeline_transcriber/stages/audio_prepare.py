@@ -53,7 +53,7 @@ class AudioPrepareStage(BaseStage):
             source_dur = source_meta.get("duration_sec")
             if source_dur is not None:
                 diff = abs(probe["duration_sec"] - float(source_dur))
-                if diff > 2.0:
+                if diff > ctx.config.ffmpeg.duration_tolerance_sec:
                     log.warning(
                         "duration_mismatch",
                         source_duration=source_dur,

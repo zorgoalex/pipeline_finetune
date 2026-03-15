@@ -46,6 +46,7 @@ class FfmpegConfig(BaseModel):
     audio_sr: int = Field(default=16000)
     audio_channels: int = Field(default=1)
     normalize_audio: bool = Field(default=False)
+    duration_tolerance_sec: float = Field(default=2.0)
 
 
 class VadConfig(BaseModel):
@@ -62,7 +63,7 @@ class AsrConfig(BaseModel):
     engine: str = Field(default="whisperx")
     model_name: str = Field(default="small")
     device: Literal["cpu", "cuda", "auto"] = Field(default="auto")
-    compute_type: Literal["int8", "float16", "float32"] = Field(default="float16")
+    compute_type: Literal["int8", "float16", "float32"] = Field(default="int8")
     beam_size: int = Field(default=5)
     batch_size: int = Field(default=16)
     language: str = Field(default="auto")

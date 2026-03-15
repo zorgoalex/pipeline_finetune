@@ -213,6 +213,19 @@ class QaStage(BaseStage):
                     "details": f"Manifest clips={len(manifest)} vs VAD segments={len(vad_segments)}.",
                 })
 
+            # Processed clips >= valid clips
+            clips_processed = (ctx.asr_result or {}).get("clips_processed", 0)
+            if clips_processed > 0 or vad_segments:
+                valid_clips = len(vad_segments)
+                processed_ok = clips_processed >= valid_clips
+                checks.append({
+                    "name": "processed_clips_ge_valid",
+                    "passed": processed_ok,
+                    "details": (
+                        f"Processed {clips_processed} clips vs {valid_clips} valid VAD segments."
+                    ),
+                })
+
             actual_clip_ids = {
                 seg.get("source_clip_id")
                 for seg in segments
