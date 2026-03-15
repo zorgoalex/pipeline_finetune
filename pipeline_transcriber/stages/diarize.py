@@ -149,18 +149,36 @@ class DiarizeStage(BaseStage):
         audio = whisperx.load_audio(str(ctx.audio_path))
         diarize_result = diarize_model(audio, **diarize_kwargs)
 
-        # Convert pyannote output to segment dicts
+        # Convert diarization output to segment dicts.
+        # whisperx 3.8+ returns a DataFrame; older versions return pyannote Annotation.
         segments: list[dict] = []
         speakers_seen: set[str] = set()
 
-        for turn, _, speaker in diarize_result.itertracks(yield_label=True):
-            segments.append({
-                "start": round(turn.start, 3),
-                "end": round(turn.end, 3),
-                "duration": round(turn.end - turn.start, 3),
-                "speaker": speaker,
-            })
-            speakers_seen.add(speaker)
+        if hasattr(diarize_result, "itertracks"):
+            # pyannote Annotation object (legacy whisperx)
+            for turn, _, speaker in diarize_result.itertracks(yield_label=True):
+                segments.append({
+                    "start": round(turn.start, 3),
+                    "end": round(turn.end, 3),
+                    "duration": round(turn.end - turn.start, 3),
+                    "speaker": speaker,
+                })
+                speakers_seen.add(speaker)
+        else:
+            # pandas DataFrame (whisperx 3.8+)
+            import pandas as pd
+            if isinstance(diarize_result, pd.DataFrame):
+                for _, row in diarize_result.iterrows():
+                    start = float(row.get("start", row.get("segment", {}).get("start", 0) if isinstance(row.get("segment"), dict) else 0))
+                    end = float(row.get("end", row.get("segment", {}).get("end", 0) if isinstance(row.get("segment"), dict) else 0))
+                    speaker = str(row.get("speaker", row.get("label", "UNKNOWN")))
+                    segments.append({
+                        "start": round(start, 3),
+                        "end": round(end, 3),
+                        "duration": round(end - start, 3),
+                        "speaker": speaker,
+                    })
+                    speakers_seen.add(speaker)
 
         segments.sort(key=lambda s: s["start"])
         return segments, len(speakers_seen)
